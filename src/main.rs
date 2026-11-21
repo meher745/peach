@@ -599,6 +599,29 @@ fn civil_ms(b: &[u8]) -> Option<i64> {
     Some((fast_days(y, mo, d, leap) * 86_400 + h * 3600 + mi * 60 + sec) * 1000)
 }
 
+/// `ingest_ts`, which rules.md guarantees is valid F1: shape-checked, digits not
+/// re-validated. Anything not shaped like F1 goes through the full parser.
+#[inline(always)]
+fn parse_ingest(b: &[u8]) -> i64 {
+    if b.len() == 20 && b[19] == b'Z' && b[4] == b'-' && b[10] == b'T' {
+        let w0 = u64::from_le_bytes(b[0..8].try_into().unwrap()) & 0x0F0F_0F0F_0F0F_0F0F;
+        let w1 = u64::from_le_bytes(b[8..16].try_into().unwrap()) & 0x0F0F_0F0F_0F0F_0F0F;
+        let w2 = u32::from_le_bytes(b[16..20].try_into().unwrap()) as u64 & 0x0F0F_0F0F;
+        let g = |x: u64, i: u32| ((x >> (8 * i)) & 0xFF) as i64;
+        let y = g(w0, 0) * 1000 + g(w0, 1) * 100 + g(w0, 2) * 10 + g(w0, 3);
+        let mo = g(w0, 5) * 10 + g(w0, 6);
+        if (1900..2300).contains(&y) && (1..=12).contains(&mo) {
+            let d = g(w1, 0) * 10 + g(w1, 1);
+            let h = g(w1, 3) * 10 + g(w1, 4);
+            let mi = g(w1, 6) * 10 + g(w1, 7);
+            let sec = g(w2, 1) * 10 + g(w2, 2);
+            let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+            return (fast_days(y, mo, d, leap) * 86_400 + h * 3600 + mi * 60 + sec) * 1000;
+        }
+    }
+    parse_ts(b).unwrap_or(i64::MAX)
+}
+
 #[inline]
 fn parse_ts(b: &[u8]) -> Option<i64> {
     let n = b.len();
@@ -692,6 +715,7 @@ struct Ev {
     person: u64,
     ts: u32,
     price: u32, // 0 unless purchase
+    pid: u32,   // dense person id inside its partition (sessions phase)
     cat: u16,
     purchase: bool,
 }
@@ -1077,7 +1101,7 @@ fn main() {
                         return;
                     }
                     let eid = pack(f[0]);
-                    let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
+                    let ingest = parse_ingest(f[3]);
                     let ing32 = (ingest.div_euclid(1000) - ws_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
                     let mut r = RawEv { eid, person: 0, ts: 0, ingest: ing32, price: 0, cat: 0, flags: 0 };
                     'v: {
@@ -1178,35 +1202,41 @@ fn main() {
                     i = (i + 1) & mask;
                 }
             };
+            // Winners go through a 64-deep ring: the person slot is prefetched when an
+            // event enters and resolved when it leaves, so the miss has time to land.
+            const RING: usize = 64;
+            let mut ring = [Ev { person: 0, ts: 0, price: 0, pid: 0, cat: 0, purchase: false }; RING];
+            let mut nr = 0usize;
+            let outv = &mut outb.0;
             let mut g = 0u32;
-            let mut win: Vec<Ev> = Vec::with_capacity(BATCH);
-            let flush = |win: &mut Vec<Ev>, outb: &mut Vec<Vec<Ev>>| {
-                for e in win.iter() {
-                    link_map.prefetch(e.person);
-                }
-                for mut e in win.drain(..) {
-                    e.person = link_map.get(e.person);
-                    outb[part(e.person)].push(e);
-                }
-            };
             for p in &p1 {
                 for r in p {
                     if r.flags & 1 != 0 && winner(r.eid) == g {
-                        win.push(Ev {
+                        link_map.prefetch(r.person);
+                        let slot = &mut ring[nr & (RING - 1)];
+                        if nr >= RING {
+                            let mut e = *slot;
+                            e.person = link_map.get(e.person);
+                            outv[part(e.person)].push(e);
+                        }
+                        *slot = Ev {
                             person: r.person,
                             ts: r.ts,
                             price: r.price,
+                            pid: 0,
                             cat: r.cat,
                             purchase: r.flags & 2 != 0,
-                        });
-                        if win.len() == BATCH {
-                            flush(&mut win, &mut outb.0);
-                        }
+                        };
+                        nr += 1;
                     }
                     g += 1;
                 }
             }
-            flush(&mut win, &mut outb.0);
+            for k in nr.saturating_sub(RING)..nr {
+                let mut e = ring[k & (RING - 1)];
+                e.person = link_map.get(e.person);
+                outv[part(e.person)].push(e);
+            }
         },
     );
     let p2 = transpose(p2.into_iter().map(|x| x.0).collect());
@@ -1214,13 +1244,16 @@ fn main() {
 
     // sessionize + attribute per person partition
     struct W {
-        camp: Vec<[i64; 4]>,
+        camp: Vec<[i64; 4]>, // [day][campaign]: credited sessions, purchasing, revenue
+        asst: Vec<u32>,      // [day][campaign]: assisted sessions
         cnt: Vec<u32>,
         pos: Vec<u32>,
         active: Vec<u32>,
         catsum: Vec<i64>,
         touched: Vec<u16>,
         rows: Vec<UserRow>,
+        ra: Vec<Ev>,
+        rb: Vec<Ev>,
     }
     let ncampo = ncamp + 1;
     let p3: Vec<W> = workers(
@@ -1228,22 +1261,29 @@ fn main() {
         NB,
         || W {
             camp: vec![[0; 4]; ncampo * ndays],
+            asst: vec![0; ncampo * ndays],
             cnt: vec![0; ncampo],
             pos: vec![0; ncampo],
             active: Vec::new(),
             catsum: vec![0; ncat],
             touched: Vec::new(),
             rows: Vec::new(),
+            ra: Vec::new(),
+            rb: Vec::new(),
         },
         |w, b| {
-            // Group by person: dense ids in first-seen order, counting-sort scatter,
-            // then time order inside each person.
+            // Group by person with time order inside each person: dense person ids in
+            // first-seen order, then a stable LSD radix sort on ts (3 x 11 bits) and a
+            // final stable pass by person id. All histograms come from one pre-pass.
             let mine = std::mem::take(&mut *p2[b].lock().unwrap());
             let n: usize = mine.iter().map(|o| o.len()).sum();
             let mut pm: KMap<u32> = KMap::with_capacity_and_hasher(n / 8 + 16, Default::default());
             let mut persons: Vec<u64> = Vec::new();
             let mut eoff: Vec<usize> = Vec::new();
-            let mut pid: Vec<u32> = Vec::with_capacity(n);
+            let mut pidv: Vec<u32> = Vec::with_capacity(n);
+            let mut h0 = vec![0usize; 2048];
+            let mut h1 = vec![0usize; 2048];
+            let mut h2 = vec![0usize; 1024];
             for o in &mine {
                 for e in o {
                     let id = *pm.entry(e.person).or_insert_with(|| {
@@ -1252,40 +1292,71 @@ fn main() {
                         (persons.len() - 1) as u32
                     });
                     eoff[id as usize] += 1;
-                    pid.push(id);
+                    pidv.push(id);
+                    h0[(e.ts & 2047) as usize] += 1;
+                    h1[((e.ts >> 11) & 2047) as usize] += 1;
+                    h2[(e.ts >> 22) as usize] += 1;
                 }
             }
             let np = persons.len();
-            let mut acc = 0;
-            for x in eoff.iter_mut() {
-                let c = *x;
-                *x = acc;
-                acc += c;
+            fn excl(h: &mut [usize]) -> usize {
+                let mut acc = 0;
+                for x in h.iter_mut() {
+                    let c = *x;
+                    *x = acc;
+                    acc += c;
+                }
+                acc
             }
-            eoff.push(acc);
-            let mut ev: Vec<Ev> = Vec::with_capacity(n);
+            excl(&mut h0);
+            excl(&mut h1);
+            excl(&mut h2);
+            let total = excl(&mut eoff);
+            eoff.push(total);
+            let mut ra = std::mem::take(&mut w.ra);
+            let mut rb = std::mem::take(&mut w.rb);
+            ra.clear();
+            rb.clear();
+            ra.reserve(n);
+            rb.reserve(n);
             {
-                let mut fill = eoff.clone();
-                let dst = ev.as_mut_ptr();
+                let pa = ra.as_mut_ptr();
+                let pb = rb.as_mut_ptr();
                 let mut k = 0;
                 for o in &mine {
                     for e in o {
-                        let id = pid[k] as usize;
-                        unsafe { dst.add(fill[id]).write(*e) };
-                        fill[id] += 1;
+                        let mut e = *e;
+                        e.pid = pidv[k];
                         k += 1;
+                        let d = (e.ts & 2047) as usize;
+                        unsafe { pa.add(h0[d]).write(e) };
+                        h0[d] += 1;
                     }
                 }
-                unsafe { ev.set_len(n) };
+                for k in 0..n {
+                    let e = unsafe { *pa.add(k) };
+                    let d = ((e.ts >> 11) & 2047) as usize;
+                    unsafe { pb.add(h1[d]).write(e) };
+                    h1[d] += 1;
+                }
+                for k in 0..n {
+                    let e = unsafe { *pb.add(k) };
+                    let d = (e.ts >> 22) as usize;
+                    unsafe { pa.add(h2[d]).write(e) };
+                    h2[d] += 1;
+                }
+                let mut fill = eoff.clone();
+                for k in 0..n {
+                    let e = unsafe { *pa.add(k) };
+                    let d = e.pid as usize;
+                    unsafe { pb.add(fill[d]).write(e) };
+                    fill[d] += 1;
+                }
+                unsafe { rb.set_len(n) };
             }
             drop(mine);
-            drop(pid);
-            for pi in 0..np {
-                let r = &mut ev[eoff[pi]..eoff[pi + 1]];
-                if r.len() > 1 {
-                    r.sort_unstable_by_key(|e| e.ts);
-                }
-            }
+            drop(pidv);
+            let ev: &[Ev] = &rb;
 
             let mine = std::mem::take(&mut *clicks_by[b].lock().unwrap());
             let mut coff = vec![0usize; np + 1];
@@ -1426,12 +1497,13 @@ fn main() {
                     }
                     let credited = if hi > lo { cl[hi - 1].camp } else { organic } as usize;
                     let di = (d - ws_day) as usize;
-                    let a = &mut w.camp[credited * ndays + di];
+                    let a = &mut w.camp[di * ncampo + credited];
                     a[0] += 1;
                     a[1] += purch as i64;
                     a[2] += rev;
+                    let row = &mut w.asst[di * ncampo..(di + 1) * ncampo];
                     for &c in &w.active {
-                        w.camp[c as usize * ndays + di][3] += 1;
+                        row[c as usize] += 1;
                     }
                 }
                 flush!();
@@ -1440,12 +1512,27 @@ fn main() {
                 }
                 w.active.clear();
             }
+            w.ra = ra;
+            w.rb = rb;
         },
     );
     lap("sessions done");
 
     // outputs
-    write_outputs(&out, p3.into_iter().map(|w| (w.camp, w.rows)).collect(), &cats, &camp_ids, &camp_ch, ncampo, ndays, ws_day, nthreads);
+    let parts: Vec<(Vec<[i64; 4]>, Vec<UserRow>)> = p3
+        .into_iter()
+        .map(|w| {
+            let mut c = vec![[0i64; 4]; ncampo * ndays];
+            for d in 0..ndays {
+                for k in 0..ncampo {
+                    let a = w.camp[d * ncampo + k];
+                    c[k * ndays + d] = [a[0], a[1], a[2], w.asst[d * ncampo + k] as i64];
+                }
+            }
+            (c, w.rows)
+        })
+        .collect();
+    write_outputs(&out, parts, &cats, &camp_ids, &camp_ch, ncampo, ndays, ws_day, nthreads);
     lap("written");
     // skip freeing everything
     std::process::exit(0);
