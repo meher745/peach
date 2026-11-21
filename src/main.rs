@@ -166,18 +166,40 @@ fn prefetch<T>(p: *const T) {
 struct LinkTable {
     slots: Vec<[u64; 2]>,
     mask: usize,
+    filter: Vec<u64>, // one bit per hash bucket: set when some key maps there
+    fshift: u32,
 }
 
 impl LinkTable {
     fn new(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(2);
-        LinkTable { slots: vec![[0, 0]; cap], mask: cap - 1 }
+        // ~20 filter bits per key (~5% false positives), at least 64
+        let fbits = (n * 20).next_power_of_two().max(64);
+        LinkTable {
+            slots: vec![[0, 0]; cap],
+            mask: cap - 1,
+            filter: vec![0; fbits / 64],
+            fshift: 64 - fbits.trailing_zeros(),
+        }
+    }
+    #[inline(always)]
+    fn fbit(&self, k: u64) -> usize {
+        // top bits of a second mix, independent of the slot index
+        (mix(k ^ 0x5851_F42D_4C95_7F2D) >> self.fshift) as usize
+    }
+    /// False means the key is certainly not in the table.
+    #[inline(always)]
+    fn maybe(&self, k: u64) -> bool {
+        let b = self.fbit(k);
+        unsafe { (*self.filter.get_unchecked(b >> 6) >> (b & 63)) & 1 != 0 }
     }
     #[inline(always)]
     fn slot(&self, k: u64) -> usize {
         mix(k) as usize & self.mask
     }
     fn insert(&mut self, k: u64, v: u64) {
+        let b = self.fbit(k);
+        self.filter[b >> 6] |= 1 << (b & 63);
         let mut i = self.slot(k);
         loop {
             if self.slots[i][0] == 0 || self.slots[i][0] == k {
@@ -1155,8 +1177,18 @@ fn main() {
     let nl = lch.len();
     let link_parts: Mutex<Vec<Vec<(u64, u64)>>> = Mutex::new(Vec::new());
     let links_left = AtomicUsize::new(nl);
+    // Dedup tuples: everything dedup needs, and where the full record went.
+    #[derive(Clone, Copy)]
+    struct Tup {
+        eid: u64,
+        ingest: u32,
+        loc: u32, // index into the worker's record array; u32::MAX for an invalid copy
+    }
+    const NE: usize = 256; // event_id partitions
     struct P1 {
-        ev: Vec<Vec<RawEv>>,
+        tup: Vec<Vec<Tup>>,
+        rec: Vec<Ev>,   // valid events in parse order; person holds the user ID until resolved
+        alive: Vec<u8>, // 1 per record; dedup clears losers
         cl: Vec<Vec<Click>>,
         buf: Vec<u8>,
         bits: Vec<[u64; 3]>,
@@ -1167,13 +1199,16 @@ fn main() {
             lt.prefetch(c.person);
         }
         for mut c in pend.drain(..) {
-            c.person = lt.get(c.person);
+            if lt.maybe(c.person) {
+                c.person = lt.get(c.person);
+            }
             cl[part(c.person)].push(c);
         }
     }
     let ebytes: usize = esrc.lens.iter().sum();
     let cbytes: usize = csrc.lens.iter().sum();
-    let ecap = ebytes / 60 / nthreads / NB + 64;
+    let tcap = ebytes / 60 / nthreads / NE + 64;
+    let rcap = ebytes / 70 / nthreads + 1024;
     let ccap = cbytes / 40 / nthreads / NB + 64;
     let p1: Vec<P1> = std::thread::scope(|sc| {
     sc.spawn(|| {
@@ -1189,9 +1224,11 @@ fn main() {
         nthreads,
         nl + ne + cch.len(),
         || P1 {
-            ev: (0..NB).map(|_| Vec::with_capacity(ecap)).collect(),
+            tup: (0..NE).map(|_| Vec::with_capacity(tcap)).collect(),
+            rec: Vec::with_capacity(rcap),
+            alive: Vec::with_capacity(rcap),
             cl: (0..NB).map(|_| Vec::with_capacity(ccap)).collect(),
-            buf: Vec::with_capacity(CHUNK + 70000),
+            buf: Vec::new(),
             bits: Vec::new(),
             pendc: Vec::with_capacity(BATCH),
         },
@@ -1217,7 +1254,7 @@ fn main() {
                     let eid = pack(f[0]);
                     let ingest = parse_ingest(f[3]);
                     let ing32 = (ingest.div_euclid(1000) - ws_s + (1i64 << 31)).clamp(0, u32::MAX as i64) as u32;
-                    let mut r = RawEv { eid, person: 0, ts: 0, ingest: ing32, price: 0, cat: 0, flags: 0 };
+                    let mut loc = u32::MAX;
                     'v: {
                         if f[1].is_empty() || f[5].is_empty() {
                             break 'v;
@@ -1226,21 +1263,23 @@ fn main() {
                         if ts < ws || ts >= we || ingest.saturating_sub(ts) > DAY {
                             break 'v;
                         }
+                        let mut e = Ev { person: 0, ts: (ts - ws) as u32, price: 0, pid: 0, cat: 0, purchase: false };
                         match f[4] {
                             b"view" | b"cart" => {}
                             b"purchase" => {
                                 let Some(p) = parse_price(f[6]) else { break 'v };
-                                r.price = p;
-                                r.cat = *products.get(&pack(f[5])).unwrap_or(&unknown);
-                                r.flags |= 2;
+                                e.price = p;
+                                e.cat = *products.get(&pack(f[5])).unwrap_or(&unknown);
+                                e.purchase = true;
                             }
                             _ => break 'v,
                         }
-                        r.ts = (ts - ws) as u32;
-                        r.person = pack_reg(f[1]); // the ID; the person is looked up after dedup
-                        r.flags |= 1;
+                        e.person = pack_reg(f[1]); // the ID; the person is looked up after dedup
+                        loc = st.rec.len() as u32;
+                        st.rec.push(e);
+                        st.alive.push(1);
                     }
-                    st.ev[part(r.eid)].push(r);
+                    st.tup[part(eid) & (NE - 1)].push(Tup { eid, ingest: ing32, loc });
                 });
             } else {
                 scan_lines::<4>(load_chunk(&csrc, cch[t - ne], &mut st.buf), &mut st.bits, |f| {
@@ -1266,89 +1305,152 @@ fn main() {
     });
     lap("events+clicks parsed");
     let link_map = link_cell.get().unwrap();
+    let nw = p1.len();
 
-    // dedup events by event_id, re-partition survivors by person
-    let (p1e, p1c): (Vec<Vec<Vec<RawEv>>>, Vec<Vec<Vec<Click>>>) = p1.into_iter().map(|p| (p.ev, p.cl)).unzip();
-    let p1e = transpose(p1e);
-    let clicks_by = transpose(p1c);
-    let p2: Vec<(Vec<Vec<Ev>>, Vec<(u64, u32, u32)>, Vec<u32>)> = workers(
+    // Dedup per event_id partition: the first copy seen is held in the table; each
+    // later copy loses to it or replaces it (smaller ingest), and the loser's alive
+    // byte is cleared on the spot. Equal ingest: the held copy stays.
+    struct Shared(Vec<*mut u8>);
+    unsafe impl Sync for Shared {}
+    impl Shared {
+        fn at(&self, w: usize) -> *mut u8 {
+            self.0[w]
+        }
+    }
+    let mut tups: Vec<Vec<Mutex<Vec<Tup>>>> = Vec::with_capacity(nw);
+    let mut recs: Vec<Mutex<Vec<Ev>>> = Vec::with_capacity(nw);
+    let mut alives: Vec<Vec<u8>> = Vec::with_capacity(nw);
+    let mut clv: Vec<Vec<Vec<Click>>> = Vec::with_capacity(nw);
+    for p in p1 {
+        tups.push(p.tup.into_iter().map(Mutex::new).collect());
+        recs.push(Mutex::new(p.rec));
+        alives.push(p.alive);
+        clv.push(p.cl);
+    }
+    let clicks_by = transpose(clv);
+    let alive_ptr = Shared(alives.iter_mut().map(|a| a.as_mut_ptr()).collect());
+    workers(
         nthreads,
-        NB,
-        || ((0..NB).map(|_| Vec::new()).collect::<Vec<Vec<Ev>>>(), Vec::new(), Vec::new()),
-        |outb, b| {
-            let p1 = std::mem::take(&mut *p1e[b].lock().unwrap());
-            let total: usize = p1.iter().map(|p| p.len()).sum();
-            // eid -> (smallest ingest, index of that copy); eid 0 never occurs (empty IDs dropped)
+        NE,
+        Vec::<(u64, u32, u32, u32)>::new,
+        |tab, b| {
+            let mine: Vec<Vec<Tup>> = tups.iter().map(|w| std::mem::take(&mut *w[b].lock().unwrap())).collect();
+            let total: usize = mine.iter().map(|v| v.len()).sum();
             let cap = (total * 2).next_power_of_two().max(16);
             let mask = cap - 1;
-            let (tab, slots) = (&mut outb.1, &mut outb.2);
-            slots.clear();
-            slots.reserve(total);
             tab.clear();
-            tab.resize(cap, (0, 0, 0));
-            let mut g = 0u32;
-            for p in &p1 {
-                for r in p {
-                    let mut i = mix(r.eid) as usize & mask;
+            tab.resize(cap, (0, 0, 0, 0));
+            let kill = |w: u32, loc: u32| {
+                if loc != u32::MAX {
+                    // distinct bytes per record; only this task decides about this event
+                    unsafe { alive_ptr.at(w as usize).add(loc as usize).write(0) };
+                }
+            };
+            for (w, v) in mine.iter().enumerate() {
+                for t in v {
+                    let mut i = mix(t.eid) as usize & mask;
                     loop {
-                        let t = unsafe { tab.get_unchecked_mut(i) };
-                        if t.0 == 0 {
-                            *t = (r.eid, r.ingest, g);
+                        let sl = unsafe { tab.get_unchecked_mut(i) };
+                        if sl.0 == 0 {
+                            *sl = (t.eid, t.ingest, w as u32, t.loc);
                             break;
                         }
-                        if t.0 == r.eid {
-                            if r.ingest < t.1 {
-                                t.1 = r.ingest;
-                                t.2 = g;
+                        if sl.0 == t.eid {
+                            if t.ingest < sl.1 {
+                                kill(sl.2, sl.3);
+                                *sl = (t.eid, t.ingest, w as u32, t.loc);
+                            } else {
+                                kill(w as u32, t.loc);
                             }
                             break;
                         }
                         i = (i + 1) & mask;
                     }
-                    slots.push(i as u32);
-                    g += 1;
                 }
-            }
-            let winner = |g: u32| -> u32 { unsafe { tab.get_unchecked(*slots.get_unchecked(g as usize) as usize).2 } };
-            // Winners go through a 64-deep ring: the person slot is prefetched when an
-            // event enters and resolved when it leaves, so the miss has time to land.
-            const RING: usize = 64;
-            let mut ring = [Ev { person: 0, ts: 0, price: 0, pid: 0, cat: 0, purchase: false }; RING];
-            let mut nr = 0usize;
-            let outv = &mut outb.0;
-            let mut g = 0u32;
-            for p in &p1 {
-                for r in p {
-                    if r.flags & 1 != 0 && winner(g) == g {
-                        link_map.prefetch(r.person);
-                        let slot = &mut ring[nr & (RING - 1)];
-                        if nr >= RING {
-                            let mut e = *slot;
-                            e.person = link_map.get(e.person);
-                            outv[part(e.person)].push(e);
-                        }
-                        *slot = Ev {
-                            person: r.person,
-                            ts: r.ts,
-                            price: r.price,
-                            pid: 0,
-                            cat: r.cat,
-                            purchase: r.flags & 2 != 0,
-                        };
-                        nr += 1;
-                    }
-                    g += 1;
-                }
-            }
-            for k in nr.saturating_sub(RING)..nr {
-                let mut e = ring[k & (RING - 1)];
-                e.person = link_map.get(e.person);
-                outv[part(e.person)].push(e);
             }
         },
     );
-    let p2 = transpose(p2.into_iter().map(|x| x.0).collect());
+    drop(tups);
     lap("events deduped");
+
+    // Person shuffle, count then scatter: each worker resolves the person of its alive
+    // records (prefetch ring over the link table), counts them per person partition,
+    // then writes them straight into one shared array at its own offsets.
+    let counts: Vec<Mutex<Vec<usize>>> = (0..nw).map(|_| Mutex::new(Vec::new())).collect();
+    workers(nthreads, nw, || (), |_, w| {
+        let mut rec = recs[w].lock().unwrap();
+        let alive = &alives[w];
+        let mut c = vec![0usize; NB];
+        const RING: usize = 64;
+        let mut ring = [0u32; RING];
+        let mut nr = 0usize;
+        for i in 0..rec.len() {
+            if alive[i] == 0 {
+                continue;
+            }
+            if !link_map.maybe(rec[i].person) {
+                c[part(rec[i].person)] += 1; // not linked: the ID is the person
+                continue;
+            }
+            link_map.prefetch(rec[i].person);
+            let slot = &mut ring[nr & (RING - 1)];
+            if nr >= RING {
+                let j = *slot as usize;
+                let p = link_map.get(rec[j].person);
+                rec[j].person = p;
+                c[part(p)] += 1;
+            }
+            *slot = i as u32;
+            nr += 1;
+        }
+        for k in nr.saturating_sub(RING)..nr {
+            let j = ring[k & (RING - 1)] as usize;
+            let p = link_map.get(rec[j].person);
+            rec[j].person = p;
+            c[part(p)] += 1;
+        }
+        *counts[w].lock().unwrap() = c;
+    });
+    let counts: Vec<Vec<usize>> = counts.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let mut off: Vec<Vec<usize>> = vec![vec![0; NB]; nw];
+    let mut bstart = vec![0usize; NB + 1];
+    let mut acc = 0;
+    for b in 0..NB {
+        bstart[b] = acc;
+        for w in 0..nw {
+            off[w][b] = acc;
+            acc += counts[w][b];
+        }
+    }
+    bstart[NB] = acc;
+    let mut all: Vec<Ev> = Vec::with_capacity(acc);
+    struct EvPtr(*mut Ev);
+    unsafe impl Sync for EvPtr {}
+    impl EvPtr {
+        fn get(&self) -> *mut Ev {
+            self.0
+        }
+    }
+    let dst = EvPtr(all.as_mut_ptr());
+    workers(nthreads, nw, || (), |_, w| {
+        let rec = recs[w].lock().unwrap();
+        let alive = &alives[w];
+        let mut pos = off[w].clone();
+        for i in 0..rec.len() {
+            if alive[i] != 0 {
+                let e = rec[i];
+                let b = part(e.person);
+                // disjoint ranges per (bucket, worker)
+                unsafe { dst.get().add(pos[b]).write(e) };
+                pos[b] += 1;
+            }
+        }
+    });
+    unsafe { all.set_len(acc) };
+    drop(recs);
+    drop(alives);
+    lap("persons shuffled");
+
 
     // sessionize + attribute per person partition
     struct W {
@@ -1383,8 +1485,8 @@ fn main() {
             // Group by person with time order inside each person: dense person ids in
             // first-seen order, then a stable LSD radix sort on ts (3 x 11 bits) and a
             // final stable pass by person id. All histograms come from one pre-pass.
-            let mine = std::mem::take(&mut *p2[b].lock().unwrap());
-            let n: usize = mine.iter().map(|o| o.len()).sum();
+            let mine: &[Ev] = &all[bstart[b]..bstart[b + 1]];
+            let n: usize = mine.len();
             let mut pm: KMap<u32> = KMap::with_capacity_and_hasher(n / 8 + 16, Default::default());
             let mut persons: Vec<u64> = Vec::new();
             let mut eoff: Vec<usize> = Vec::new();
@@ -1392,19 +1494,17 @@ fn main() {
             let mut h0 = vec![0usize; 2048];
             let mut h1 = vec![0usize; 2048];
             let mut h2 = vec![0usize; 1024];
-            for o in &mine {
-                for e in o {
-                    let id = *pm.entry(e.person).or_insert_with(|| {
-                        persons.push(e.person);
-                        eoff.push(0);
-                        (persons.len() - 1) as u32
-                    });
-                    eoff[id as usize] += 1;
-                    pidv.push(id);
-                    h0[(e.ts & 2047) as usize] += 1;
-                    h1[((e.ts >> 11) & 2047) as usize] += 1;
-                    h2[(e.ts >> 22) as usize] += 1;
-                }
+            for e in mine {
+                let id = *pm.entry(e.person).or_insert_with(|| {
+                    persons.push(e.person);
+                    eoff.push(0);
+                    (persons.len() - 1) as u32
+                });
+                eoff[id as usize] += 1;
+                pidv.push(id);
+                h0[(e.ts & 2047) as usize] += 1;
+                h1[((e.ts >> 11) & 2047) as usize] += 1;
+                h2[(e.ts >> 22) as usize] += 1;
             }
             let np = persons.len();
             fn excl(h: &mut [usize]) -> usize {
@@ -1430,16 +1530,12 @@ fn main() {
             {
                 let pa = ra.as_mut_ptr();
                 let pb = rb.as_mut_ptr();
-                let mut k = 0;
-                for o in &mine {
-                    for e in o {
-                        let mut e = *e;
-                        e.pid = pidv[k];
-                        k += 1;
-                        let d = (e.ts & 2047) as usize;
-                        unsafe { pa.add(h0[d]).write(e) };
-                        h0[d] += 1;
-                    }
+                for (k, e) in mine.iter().enumerate() {
+                    let mut e = *e;
+                    e.pid = pidv[k];
+                    let d = (e.ts & 2047) as usize;
+                    unsafe { pa.add(h0[d]).write(e) };
+                    h0[d] += 1;
                 }
                 for k in 0..n {
                     let e = unsafe { *pa.add(k) };
@@ -1462,7 +1558,6 @@ fn main() {
                 }
                 unsafe { rb.set_len(n) };
             }
-            drop(mine);
             drop(pidv);
             let ev: &[Ev] = &rb;
 
