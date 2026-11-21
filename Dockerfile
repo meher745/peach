@@ -13,6 +13,6 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /solution /app/solution
 # keep freed memory instead of returning it to the OS (avoids re-zeroing pages)
-ENV MIMALLOC_PURGE_DELAY=-1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1
+ENV MIMALLOC_PURGE_DELAY=-1 MIMALLOC_ALLOW_LARGE_OS_PAGES=1 THREADS=12
 USER 1000
 CMD ["/app/solution"]
