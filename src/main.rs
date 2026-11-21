@@ -835,16 +835,6 @@ fn parse_price(b: &[u8]) -> Option<u32> {
 
 // ---------------------------------------------------------------- records
 
-#[derive(Clone, Copy)]
-struct RawEv {
-    eid: u64,
-    person: u64,
-    ts: u32,     // ms after window_start (valid only)
-    ingest: u32, // seconds, offset so that order is kept
-    price: u32,
-    cat: u16,
-    flags: u8, // 1 valid, 2 purchase
-}
 
 #[derive(Clone, Copy)]
 struct Ev {
@@ -912,6 +902,98 @@ fn workers<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync>(
             .collect();
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     })
+}
+
+/// Like `workers`, but each thread calls `fin(state, thread index)` once it runs out of tasks.
+fn workers_fin<S: Send, I: Fn() -> S + Sync, F: Fn(&mut S, usize) + Sync, G: Fn(&mut S, usize) + Sync>(
+    nthreads: usize,
+    ntasks: usize,
+    init: I,
+    f: F,
+    fin: G,
+) -> Vec<S> {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..nthreads)
+            .map(|ti| {
+                let (next, init, f, fin) = (&next, &init, &f, &fin);
+                sc.spawn(move || {
+                    let mut s = init();
+                    loop {
+                        let t = next.fetch_add(1, AO::Relaxed);
+                        if t >= ntasks {
+                            break;
+                        }
+                        f(&mut s, t);
+                    }
+                    fin(&mut s, ti);
+                    s
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// Writes one user_daily Parquet file.
+fn write_user_file(path: &Path, rows: &[UserRow], cats_s: &[String]) {
+    use arrow_array::builder::{Date32Builder, Int64Builder, StringBuilder};
+    use arrow_array::{ArrayRef, RecordBatch};
+    use parquet::arrow::ArrowWriter;
+    let mut uid = StringBuilder::with_capacity(rows.len(), rows.len() * 10);
+    let mut day = Date32Builder::with_capacity(rows.len());
+    let mut se = Int64Builder::with_capacity(rows.len());
+    let mut evs = Int64Builder::with_capacity(rows.len());
+    let mut rv = Int64Builder::with_capacity(rows.len());
+    let mut top = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
+    let mut nb = [0u8; 10];
+    for r in rows {
+        let k = r.person;
+        if !is_long(k) {
+            // decode into a stack buffer: no allocation per row
+            let n = (k & 0xF) as usize;
+            for (i, c) in nb[..n].iter_mut().enumerate() {
+                *c = ALPHA[((k >> (58 - 6 * i)) & 63) as usize];
+            }
+            uid.append_value(unsafe { std::str::from_utf8_unchecked(&nb[..n]) }); // alphabet is ASCII
+        } else {
+            let name = unpack(k);
+            match std::str::from_utf8(&name) {
+                Ok(x) => uid.append_value(x),
+                Err(_) => uid.append_value(String::from_utf8_lossy(&name)),
+            }
+        }
+        day.append_value(r.day);
+        se.append_value(r.sessions);
+        evs.append_value(r.events);
+        rv.append_value(r.revenue);
+        if r.top >= 0 {
+            top.append_value(&cats_s[r.top as usize]);
+        } else {
+            top.append_null();
+        }
+    }
+    let batch = RecordBatch::try_from_iter(vec![
+        ("user_id", Arc::new(uid.finish()) as ArrayRef),
+        ("day", Arc::new(day.finish()) as ArrayRef),
+        ("sessions", Arc::new(se.finish()) as ArrayRef),
+        ("events", Arc::new(evs.finish()) as ArrayRef),
+        ("revenue_cents", Arc::new(rv.finish()) as ArrayRef),
+        ("top_category", Arc::new(top.finish()) as ArrayRef),
+    ])
+    .unwrap();
+    let f = File::create(path).unwrap();
+    let mut wr = ArrowWriter::try_new(f, batch.schema(), Some(parquet_props())).unwrap();
+    wr.write(&batch).unwrap();
+    wr.close().unwrap();
+}
+
+fn parquet_props() -> parquet::file::properties::WriterProperties {
+    parquet::file::properties::WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+        .set_dictionary_enabled(false)
+        .set_statistics_enabled(parquet::file::properties::EnabledStatistics::None)
+        .build()
 }
 
 /// [worker][bucket] -> [bucket] (worker lists), each bucket taken once by its task.
@@ -1584,7 +1666,14 @@ fn main() {
         rb: Vec<Ev>,
     }
     let ncampo = ncamp + 1;
-    let p3: Vec<W> = workers(
+    // biggest partitions first (whale people make some ~20x the mean), so no thread
+    // is left alone with a big one at the end
+    let mut order: Vec<usize> = (0..NB).collect();
+    order.sort_by_key(|&b| std::cmp::Reverse(bstart[b + 1] - bstart[b]));
+    let ud = out.join("user_daily");
+    std::fs::create_dir_all(&ud).unwrap();
+    let cats_s: Vec<String> = cats.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+    let p3: Vec<W> = workers_fin(
         nthreads,
         NB,
         || W {
@@ -1599,7 +1688,8 @@ fn main() {
             ra: Vec::new(),
             rb: Vec::new(),
         },
-        |w, b| {
+        |w, t| {
+            let b = order[t];
             // Group by person with time order inside each person: dense person ids in
             // first-seen order, then a stable LSD radix sort on ts (3 x 11 bits) and a
             // final stable pass by person id. All histograms come from one pre-pass.
@@ -1836,6 +1926,13 @@ fn main() {
             w.ra = ra;
             w.rb = rb;
         },
+        |w, ti| {
+            // write this worker's user_daily rows while others finish their partitions
+            if !w.rows.is_empty() || ti == 0 {
+                write_user_file(&ud.join(format!("part-{ti}.parquet")), &w.rows, &cats_s);
+            }
+            w.rows = Vec::new();
+        },
     );
     lap("sessions done");
 
@@ -1863,7 +1960,7 @@ fn main() {
 fn write_outputs(
     out: &Path,
     parts: Vec<(Vec<[i64; 4]>, Vec<UserRow>)>,
-    cats: &[Vec<u8>],
+    _cats: &[Vec<u8>],
     camp_ids: &[Vec<u8>],
     camp_ch: &[Vec<u8>],
     ncampo: usize,
@@ -1936,47 +2033,5 @@ fn write_outputs(
         wr.close().unwrap();
     }
 
-    let jobs = Mutex::new(all_rows);
-    let cats_s: Vec<String> = cats.iter().map(|c| s(c)).collect();
-    workers(nthreads, nthreads, || (), |_, t| {
-        let Some(rows) = jobs.lock().unwrap().pop() else { return };
-        if rows.is_empty() && t != 0 {
-            return;
-        }
-        let mut uid = StringBuilder::with_capacity(rows.len(), rows.len() * 10);
-        let mut day = Date32Builder::with_capacity(rows.len());
-        let mut se = Int64Builder::with_capacity(rows.len());
-        let mut evs = Int64Builder::with_capacity(rows.len());
-        let mut rv = Int64Builder::with_capacity(rows.len());
-        let mut top = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
-        for r in &rows {
-            let name = unpack(r.person);
-            match std::str::from_utf8(&name) {
-                Ok(x) => uid.append_value(x),
-                Err(_) => uid.append_value(s(&name)),
-            }
-            day.append_value(r.day);
-            se.append_value(r.sessions);
-            evs.append_value(r.events);
-            rv.append_value(r.revenue);
-            if r.top >= 0 {
-                top.append_value(&cats_s[r.top as usize]);
-            } else {
-                top.append_null();
-            }
-        }
-        let batch = RecordBatch::try_from_iter(vec![
-            ("user_id", Arc::new(uid.finish()) as ArrayRef),
-            ("day", Arc::new(day.finish()) as ArrayRef),
-            ("sessions", Arc::new(se.finish()) as ArrayRef),
-            ("events", Arc::new(evs.finish()) as ArrayRef),
-            ("revenue_cents", Arc::new(rv.finish()) as ArrayRef),
-            ("top_category", Arc::new(top.finish()) as ArrayRef),
-        ])
-        .unwrap();
-        let f = File::create(ud.join(format!("part-{t}.parquet"))).unwrap();
-        let mut wr = ArrowWriter::try_new(f, batch.schema(), Some(props())).unwrap();
-        wr.write(&batch).unwrap();
-        wr.close().unwrap();
-    });
+    drop(all_rows);
 }
