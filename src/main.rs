@@ -1773,18 +1773,17 @@ fn main() {
         },
         |w, t| {
             let b = order[t];
-            // Group by person with time order inside each person: dense person ids in
-            // first-seen order, then a stable LSD radix sort on ts (3 x 11 bits) and a
-            // final stable pass by person id. All histograms come from one pre-pass.
+            // Group events by person (dense ids, first-seen order) in one scatter pass,
+            // then sort each person's events by ts. Equal timestamps within a person share
+            // a session and the day/revenue/category sums are order-independent there, so an
+            // unstable sort is exact. `ev.person` is unused downstream (the person key comes
+            // from `persons[pi]`), so it is left as the original key.
             let mine: &[Ev] = &all[bstart[b]..bstart[b + 1]];
             let n: usize = mine.len();
             let mut pm: KMap<u32> = KMap::with_capacity_and_hasher(n / 8 + 16, Default::default());
             let mut persons: Vec<u64> = Vec::new();
             let mut eoff: Vec<usize> = Vec::new();
             let mut pidv: Vec<u32> = Vec::with_capacity(n);
-            let mut h0 = vec![0usize; 2048];
-            let mut h1 = vec![0usize; 2048];
-            let mut h2 = vec![0usize; 1024];
             for e in mine {
                 let id = *pm.entry(e.person).or_insert_with(|| {
                     persons.push(e.person);
@@ -1793,9 +1792,6 @@ fn main() {
                 });
                 eoff[id as usize] += 1;
                 pidv.push(id);
-                h0[(e.ts & 2047) as usize] += 1;
-                h1[((e.ts >> 11) & 2047) as usize] += 1;
-                h2[(e.ts >> 22) as usize] += 1;
             }
             let np = persons.len();
             fn excl(h: &mut [usize]) -> usize {
@@ -1807,49 +1803,25 @@ fn main() {
                 }
                 acc
             }
-            excl(&mut h0);
-            excl(&mut h1);
-            excl(&mut h2);
             let total = excl(&mut eoff);
             eoff.push(total);
-            let mut ra = std::mem::take(&mut w.ra);
             let mut rb = std::mem::take(&mut w.rb);
-            ra.clear();
             rb.clear();
-            ra.reserve(n);
             rb.reserve(n);
             {
-                let pa = ra.as_mut_ptr();
                 let pb = rb.as_mut_ptr();
-                for (k, e) in mine.iter().enumerate() {
-                    let mut e = *e;
-                    e.person = pidv[k] as u64;
-                    let d = (e.ts & 2047) as usize;
-                    unsafe { pa.add(h0[d]).write(e) };
-                    h0[d] += 1;
-                }
-                for k in 0..n {
-                    let e = unsafe { *pa.add(k) };
-                    let d = ((e.ts >> 11) & 2047) as usize;
-                    unsafe { pb.add(h1[d]).write(e) };
-                    h1[d] += 1;
-                }
-                for k in 0..n {
-                    let e = unsafe { *pb.add(k) };
-                    let d = (e.ts >> 22) as usize;
-                    unsafe { pa.add(h2[d]).write(e) };
-                    h2[d] += 1;
-                }
                 let mut fill = eoff.clone();
-                for k in 0..n {
-                    let e = unsafe { *pa.add(k) };
-                    let d = e.person as usize;
-                    unsafe { pb.add(fill[d]).write(e) };
+                for (k, e) in mine.iter().enumerate() {
+                    let d = pidv[k] as usize;
+                    unsafe { pb.add(fill[d]).write(*e) };
                     fill[d] += 1;
                 }
                 unsafe { rb.set_len(n) };
             }
             drop(pidv);
+            for pi in 0..np {
+                rb[eoff[pi]..eoff[pi + 1]].sort_unstable_by_key(|e| e.ts);
+            }
             let ev: &[Ev] = &rb;
 
             let cmine: &[Click] = &allc[cbstart[b]..cbstart[b + 1]];
@@ -2000,7 +1972,6 @@ fn main() {
                 }
                 w.active.clear();
             }
-            w.ra = ra;
             w.rb = rb;
         },
         |w, ti| {
