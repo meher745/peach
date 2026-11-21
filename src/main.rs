@@ -133,6 +133,65 @@ fn cmp_str(a: u128, b: u128) -> Ordering {
     }
 }
 
+// ---------------------------------------------------------------- link table
+
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, readonly, preserves_flags))
+    }
+}
+
+/// Open-addressing map ID key -> person key; key 0 (empty string) marks a free slot.
+struct LinkTable {
+    slots: Vec<[u128; 2]>,
+    mask: usize,
+}
+
+impl LinkTable {
+    fn new(n: usize) -> Self {
+        let cap = (n * 2).next_power_of_two().max(2);
+        LinkTable { slots: vec![[0, 0]; cap], mask: cap - 1 }
+    }
+    #[inline(always)]
+    fn slot(&self, k: u128) -> usize {
+        mix(k) as usize & self.mask
+    }
+    fn insert(&mut self, k: u128, v: u128) {
+        let mut i = self.slot(k);
+        loop {
+            if self.slots[i][0] == 0 || self.slots[i][0] == k {
+                self.slots[i] = [k, v];
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u128) {
+        prefetch(self.slots.as_ptr().wrapping_add(self.slot(k)));
+    }
+    #[inline(always)]
+    fn get(&self, k: u128) -> u128 {
+        let mut i = self.slot(k);
+        loop {
+            let s = unsafe { self.slots.get_unchecked(i) };
+            if s[0] == k {
+                return s[1];
+            }
+            if s[0] == 0 {
+                return k;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 // ---------------------------------------------------------------- CSV
 
 #[inline(always)]
@@ -802,7 +861,7 @@ fn main() {
         },
     );
     lap("links parsed");
-    let link_map: KMap<u128> = {
+    let link_map: LinkTable = {
         let total: usize = pairs.iter().map(|v| v.0.len()).sum();
         let mut idx: KMap<u32> = KMap::with_capacity_and_hasher(total, Default::default());
         let mut keys: Vec<u128> = Vec::with_capacity(total);
@@ -847,7 +906,8 @@ fn main() {
                 best[r] = keys[i];
             }
         }
-        let mut m: KMap<u128> = KMap::with_capacity_and_hasher(n, Default::default());
+        let moved = (0..n).filter(|&i| best[find(&mut parent, i as u32) as usize] != keys[i]).count();
+        let mut m = LinkTable::new(moved);
         for i in 0..n {
             let r = find(&mut parent, i as u32) as usize;
             if best[r] != keys[i] {
@@ -857,7 +917,7 @@ fn main() {
         m
     };
     lap("links joined");
-    let person_of = |k: u128| -> u128 { *link_map.get(&k).unwrap_or(&k) };
+    const BATCH: usize = 64;
 
     // events + clicks parse
     let esrc = open_all(&csv_files(&data.join("events")));
@@ -870,6 +930,30 @@ fn main() {
         cl: Vec<Vec<Click>>,
         buf: Vec<u8>,
         bits: Vec<[u64; 3]>,
+        pend: Vec<RawEv>,
+        pendc: Vec<Click>,
+    }
+    fn flush_ev(pend: &mut Vec<RawEv>, ev: &mut [Vec<RawEv>], lt: &LinkTable) {
+        for r in pend.iter() {
+            if r.flags & 1 != 0 {
+                lt.prefetch(r.person);
+            }
+        }
+        for mut r in pend.drain(..) {
+            if r.flags & 1 != 0 {
+                r.person = lt.get(r.person);
+            }
+            ev[part(r.eid)].push(r);
+        }
+    }
+    fn flush_cl(pend: &mut Vec<Click>, cl: &mut [Vec<Click>], lt: &LinkTable) {
+        for c in pend.iter() {
+            lt.prefetch(c.person);
+        }
+        for mut c in pend.drain(..) {
+            c.person = lt.get(c.person);
+            cl[part(c.person)].push(c);
+        }
     }
     let ebytes: usize = esrc.lens.iter().sum();
     let cbytes: usize = csrc.lens.iter().sum();
@@ -883,6 +967,8 @@ fn main() {
             cl: (0..NB).map(|_| Vec::with_capacity(ccap)).collect(),
             buf: Vec::with_capacity(CHUNK + 70000),
             bits: Vec::new(),
+            pend: Vec::with_capacity(BATCH),
+            pendc: Vec::with_capacity(BATCH),
         },
         |st, t| {
             if t < ne {
@@ -913,11 +999,15 @@ fn main() {
                             _ => break 'v,
                         }
                         r.ts = (ts - ws) as u32;
-                        r.person = person_of(pack_reg(f[1]));
+                        r.person = pack_reg(f[1]); // ID now, person after the batch lookup
                         r.flags |= 1;
                     }
-                    st.ev[part(eid)].push(r);
+                    st.pend.push(r);
+                    if st.pend.len() == BATCH {
+                        flush_ev(&mut st.pend, &mut st.ev, &link_map);
+                    }
                 });
+                flush_ev(&mut st.pend, &mut st.ev, &link_map);
             } else {
                 scan_lines::<'_, 4>(load_chunk(&csrc, cch[t - ne], &mut st.buf), &mut st.bits, |f| {
                     if f[0].is_empty() || f[1].is_empty() {
@@ -928,10 +1018,14 @@ fn main() {
                         return;
                     }
                     let Some(&camp) = campaigns.get(&pack(f[2])) else { return };
-                    let person = person_of(pack_reg(f[1]));
+                    let person = pack_reg(f[1]);
                     let click = pack_reg(f[0]);
-                    st.cl[part(person)].push(Click { person, click, ts, camp });
+                    st.pendc.push(Click { person, click, ts, camp });
+                    if st.pendc.len() == BATCH {
+                        flush_cl(&mut st.pendc, &mut st.cl, &link_map);
+                    }
                 });
+                flush_cl(&mut st.pendc, &mut st.cl, &link_map);
             }
         },
     );
