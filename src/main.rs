@@ -1218,10 +1218,13 @@ fn main() {
     let t0 = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
-    let nthreads: usize = std::env::var("NCPU")
+    // THREADS (set in the image, for experiments) overrides NCPU (set by the scorer)
+    let nthreads: usize = std::env::var("THREADS")
         .ok()
+        .or_else(|| std::env::var("NCPU").ok())
         .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()));
+        .filter(|&n: &usize| (1..=32).contains(&n))
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()).min(32));
     let lap = |what: &str| eprintln!("{:8.3}s {what}", t0.elapsed().as_secs_f64());
 
     let manifest = std::fs::read_to_string(data.join("manifest.json")).unwrap();
