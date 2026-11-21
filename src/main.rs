@@ -44,12 +44,8 @@ fn mix(k: u64) -> u64 {
 
 #[inline(always)]
 fn part(k: u64) -> usize {
-    let mut x = k ^ 0x2545_F491_4F6C_DD1D;
-    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    x ^= x >> 33;
-    (x as usize) & (NB - 1)
+    // Fibonacci hashing: top bits of one multiply (partition choice only; tables use mix)
+    ((k ^ (k >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - NB.trailing_zeros())) as usize
 }
 
 #[derive(Default)]
