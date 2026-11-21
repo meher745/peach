@@ -825,11 +825,15 @@ fn open_all(paths: &[PathBuf]) -> Src {
 
 /// Nominal (file, start, end) byte ranges. A range owns the lines that start inside it.
 fn chunks(src: &Src) -> Vec<(usize, usize, usize)> {
+    chunks_sized(src, CHUNK)
+}
+
+fn chunks_sized(src: &Src, size: usize) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::new();
     for (fi, &n) in src.lens.iter().enumerate() {
         let mut s = 0;
         while s < n {
-            let e = (s + CHUNK).min(n);
+            let e = (s + size).min(n);
             out.push((fi, s, e));
             s = e;
         }
@@ -923,21 +927,7 @@ fn manifest_ts(text: &str, key: &str) -> i64 {
 }
 
 /// Joins linked IDs; maps every linked ID whose person name differs to that name.
-fn build_links(data: &Path) -> LinkTable {
-    let lsrc = open_all(&csv_files(&data.join("links")));
-    let lch = chunks(&lsrc);
-    let mut buf = Vec::new();
-    let mut bits = Vec::new();
-    let mut v: Vec<(u64, u64)> = Vec::new();
-    for &c in &lch {
-        scan_lines::<2>(load_chunk(&lsrc, c, &mut buf), &mut bits, |f| {
-            if f[0].is_empty() || f[1].is_empty() {
-                return;
-            }
-            v.push((pack_reg(f[0]), pack_reg(f[1])));
-        });
-    }
-    let pairs = [v];
+fn build_link_table(pairs: Vec<Vec<(u64, u64)>>) -> LinkTable {
     let link_map: LinkTable = {
         let total: usize = pairs.iter().map(|v| v.len()).sum();
         let mut idx: KMap<u32> = KMap::with_capacity_and_hasher(total, Default::default());
@@ -1059,6 +1049,11 @@ fn main() {
     let ech = chunks(&esrc);
     let cch = chunks(&csrc);
     let ne = ech.len();
+    let lsrc = open_all(&csv_files(&data.join("links")));
+    let lch = chunks_sized(&lsrc, 1 << 20);
+    let nl = lch.len();
+    let link_parts: Mutex<Vec<Vec<(u64, u64)>>> = Mutex::new(Vec::new());
+    let links_left = AtomicUsize::new(nl);
     struct P1 {
         ev: Vec<Vec<RawEv>>,
         cl: Vec<Vec<Click>>,
@@ -1081,12 +1076,17 @@ fn main() {
     let ccap = cbytes / 40 / nthreads / NB + 64;
     let p1: Vec<P1> = std::thread::scope(|sc| {
     sc.spawn(|| {
-        let _ = link_cell.set(build_links(&data));
+        // union-find once every link chunk is parsed (they are the first tasks)
+        while links_left.load(AO::Acquire) > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+        let parts = std::mem::take(&mut *link_parts.lock().unwrap());
+        let _ = link_cell.set(build_link_table(parts));
         lap("links joined");
     });
     workers(
         nthreads,
-        ne + cch.len(),
+        nl + ne + cch.len(),
         || P1 {
             ev: (0..NB).map(|_| Vec::with_capacity(ecap)).collect(),
             cl: (0..NB).map(|_| Vec::with_capacity(ccap)).collect(),
@@ -1095,6 +1095,19 @@ fn main() {
             pendc: Vec::with_capacity(BATCH),
         },
         |st, t| {
+            if t < nl {
+                let mut v: Vec<(u64, u64)> = Vec::new();
+                scan_lines::<2>(load_chunk(&lsrc, lch[t], &mut st.buf), &mut st.bits, |f| {
+                    if f[0].is_empty() || f[1].is_empty() {
+                        return;
+                    }
+                    v.push((pack_reg(f[0]), pack_reg(f[1])));
+                });
+                link_parts.lock().unwrap().push(v);
+                links_left.fetch_sub(1, AO::Release);
+                return;
+            }
+            let t = t - nl;
             if t < ne {
                 scan_lines::<7>(load_chunk(&esrc, ech[t], &mut st.buf), &mut st.bits, |f| {
                     if f[0].is_empty() {
@@ -1157,17 +1170,19 @@ fn main() {
     let (p1e, p1c): (Vec<Vec<Vec<RawEv>>>, Vec<Vec<Vec<Click>>>) = p1.into_iter().map(|p| (p.ev, p.cl)).unzip();
     let p1e = transpose(p1e);
     let clicks_by = transpose(p1c);
-    let p2: Vec<(Vec<Vec<Ev>>, Vec<(u64, u32, u32)>)> = workers(
+    let p2: Vec<(Vec<Vec<Ev>>, Vec<(u64, u32, u32)>, Vec<u32>)> = workers(
         nthreads,
         NB,
-        || ((0..NB).map(|_| Vec::new()).collect::<Vec<Vec<Ev>>>(), Vec::new()),
+        || ((0..NB).map(|_| Vec::new()).collect::<Vec<Vec<Ev>>>(), Vec::new(), Vec::new()),
         |outb, b| {
             let p1 = std::mem::take(&mut *p1e[b].lock().unwrap());
             let total: usize = p1.iter().map(|p| p.len()).sum();
             // eid -> (smallest ingest, index of that copy); eid 0 never occurs (empty IDs dropped)
             let cap = (total * 2).next_power_of_two().max(16);
             let mask = cap - 1;
-            let tab = &mut outb.1;
+            let (tab, slots) = (&mut outb.1, &mut outb.2);
+            slots.clear();
+            slots.reserve(total);
             tab.clear();
             tab.resize(cap, (0, 0, 0));
             let mut g = 0u32;
@@ -1189,19 +1204,11 @@ fn main() {
                         }
                         i = (i + 1) & mask;
                     }
+                    slots.push(i as u32);
                     g += 1;
                 }
             }
-            let winner = |eid: u64| -> u32 {
-                let mut i = mix(eid) as usize & mask;
-                loop {
-                    let t = unsafe { tab.get_unchecked(i) };
-                    if t.0 == eid {
-                        return t.2;
-                    }
-                    i = (i + 1) & mask;
-                }
-            };
+            let winner = |g: u32| -> u32 { unsafe { tab.get_unchecked(*slots.get_unchecked(g as usize) as usize).2 } };
             // Winners go through a 64-deep ring: the person slot is prefetched when an
             // event enters and resolved when it leaves, so the miss has time to land.
             const RING: usize = 64;
@@ -1211,7 +1218,7 @@ fn main() {
             let mut g = 0u32;
             for p in &p1 {
                 for r in p {
-                    if r.flags & 1 != 0 && winner(r.eid) == g {
+                    if r.flags & 1 != 0 && winner(g) == g {
                         link_map.prefetch(r.person);
                         let slot = &mut ring[nr & (RING - 1)];
                         if nr >= RING {
