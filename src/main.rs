@@ -446,13 +446,13 @@ fn scan_window<'a, const N: usize>(buf: &'a [u8], bits: &mut Vec<[u64; 3]>, f: &
         let mut a = ls;
         for i in 0..N {
             let b = if i + 1 < N { pos[i] } else { le };
+            // branchless: sq = 1 when the field is wrapped in quotes (length >= 2)
             unsafe {
-                if q != 0 && b - a >= 2 && *buf.get_unchecked(a) == b'"' && *buf.get_unchecked(b - 1) == b'"' {
-                    out[i] = buf.get_unchecked(a + 1..b - 1);
-                    nq += 1;
-                } else {
-                    out[i] = buf.get_unchecked(a..b);
-                }
+                let first = *buf.get_unchecked(a.min(len - 1)) == b'"';
+                let last = *buf.get_unchecked(b.max(1) - 1) == b'"';
+                let sq = (first & last & (b >= a + 2)) as usize;
+                out[i] = buf.get_unchecked(a + sq..b - sq);
+                nq += sq as u32;
             }
             a = b + 1;
         }
@@ -483,12 +483,55 @@ fn scan_window<'a, const N: usize>(buf: &'a [u8], bits: &mut Vec<[u64; 3]>, f: &
 
 // ---------------------------------------------------------------- time
 
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+const fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
     let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
     era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
+}
+
+/// Days from the epoch to Jan 1 of 1900 + i.
+static YEAR_DAYS: [i32; 400] = {
+    let mut t = [0i32; 400];
+    let mut i = 0;
+    while i < 400 {
+        t[i] = days_from_civil(1900 + i as i64, 1, 1) as i32;
+        i += 1;
+    }
+    t
+};
+const MONTH_CUM: [i32; 13] = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
+#[inline(always)]
+fn fast_days(y: i64, mo: i64, d: i64, leap: bool) -> i64 {
+    if (1900..2300).contains(&y) {
+        (YEAR_DAYS[(y - 1900) as usize] + MONTH_CUM[mo as usize] + (leap && mo > 2) as i32) as i64 + d - 1
+    } else {
+        days_from_civil(y, mo, d)
+    }
+}
+
+/// Value of 8 ASCII digits (first digit in the lowest byte), already validated.
+#[inline(always)]
+fn p8(w: u64) -> u64 {
+    let x = w & 0x0F0F_0F0F_0F0F_0F0F;
+    let x = (x.wrapping_mul(10) + (x >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let x = (x.wrapping_mul(100) + (x >> 16)) & 0x0000_FFFF_0000_FFFF;
+    (x.wrapping_mul(10000) + (x >> 32)) & 0xFFFF_FFFF
+}
+
+/// Digits-only value of `b` (1..=16 bytes), None if any byte is not an ASCII digit.
+#[inline(always)]
+fn digits16(b: &[u8]) -> Option<u64> {
+    let mut buf = [b'0'; 16];
+    buf[16 - b.len()..].copy_from_slice(b);
+    let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let w1 = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+    if !(digits_ok(w0, !0) & digits_ok(w1, !0)) {
+        return None;
+    }
+    Some(p8(w0) * 100_000_000 + p8(w1))
 }
 
 #[inline]
@@ -544,21 +587,16 @@ fn civil_ms(b: &[u8]) -> Option<i64> {
     if !(1..=12).contains(&mo) || h > 23 || mi > 59 || sec > 59 || d < 1 {
         return None;
     }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
     let dim = match mo {
-        2 => {
-            if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
-                29
-            } else {
-                28
-            }
-        }
+        2 => 28 + leap as i64,
         4 | 6 | 9 | 11 => 30,
         _ => 31,
     };
     if d > dim {
         return None;
     }
-    Some((days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec) * 1000)
+    Some((fast_days(y, mo, d, leap) * 86_400 + h * 3600 + mi * 60 + sec) * 1000)
 }
 
 #[inline]
@@ -567,9 +605,14 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
     if n == 0 {
         return None;
     }
-    // F1/F2 lengths with '-' at index 4 cannot be F3; skip the digit scan for them.
-    let maybe_f3 = if n == 20 || n == 25 { b[4] != b'-' } else { true };
-    if maybe_f3 && b.iter().all(|c| c.is_ascii_digit()) {
+    // F1/F2 have '-' at index 4; anything else can only be F3 (digits only).
+    if !((n == 20 || n == 25) && b[4] == b'-') {
+        if n <= 16 {
+            return digits16(b).map(|v| v as i64);
+        }
+        if !b.iter().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
         let mut i = 0;
         while i < n && b[i] == b'0' {
             i += 1;
