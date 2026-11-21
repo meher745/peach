@@ -622,6 +622,106 @@ fn parse_ingest(b: &[u8]) -> i64 {
     parse_ts(b).unwrap_or(i64::MAX)
 }
 
+/// The local dates a timestamp in the click window can carry (window ± 1 day for
+/// F2 offsets), grouped by their `YYYY-MM-` prefix. A date outside the table is either
+/// impossible or outside the window, so it is bad either way.
+struct DateTab {
+    pre: [u64; 4],
+    base: [i64; 4], // day number = base + day of month
+    lo: [i64; 4],
+    hi: [i64; 4],
+    n: usize,
+}
+
+static DATES: std::sync::OnceLock<DateTab> = std::sync::OnceLock::new();
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + (m <= 2) as i64, m, d)
+}
+
+fn build_dates(from_ms: i64, to_ms: i64) -> DateTab {
+    let mut t = DateTab { pre: [0; 4], base: [0; 4], lo: [0; 4], hi: [0; 4], n: 0 };
+    for day in from_ms.div_euclid(DAY) - 1..=(to_ms - 1).div_euclid(DAY) + 1 {
+        let (y, m, d) = civil_from_days(day);
+        let txt = format!("{y:04}-{m:02}-");
+        let pre = u64::from_le_bytes(txt.as_bytes()[..8].try_into().unwrap());
+        if t.n > 0 && t.pre[t.n - 1] == pre {
+            t.hi[t.n - 1] = d;
+        } else {
+            assert!(t.n < 4, "window spans too many months");
+            t.pre[t.n] = pre;
+            t.base[t.n] = day - d;
+            t.lo[t.n] = d;
+            t.hi[t.n] = d;
+            t.n += 1;
+        }
+    }
+    t
+}
+
+/// `YYYY-MM-DDTHH:MM:SS` (b.len() >= 20) via the date table; None if bad or far outside the window.
+#[inline(always)]
+fn table_ms(b: &[u8], t: &DateTab) -> Option<i64> {
+    let w0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let k = (0..t.n).find(|&k| t.pre[k] == w0)?;
+    let d = d2(b, 8)?;
+    if d < t.lo[k] || d > t.hi[k] || b[10] != b'T' {
+        return None;
+    }
+    let w = u64::from_le_bytes(b[11..19].try_into().unwrap()); // HH:MM:SS
+    const D: u64 = 0xFFFF_00FF_FF00_FFFF;
+    const S: u64 = 0x0000_FF00_00FF_0000;
+    const V: u64 = ((b':' as u64) << 40) | ((b':' as u64) << 16);
+    if !(digits_ok(w, D) & ((w & S) == V)) {
+        return None;
+    }
+    let x = w & 0x0F0F_0F0F_0F0F_0F0F;
+    let g = |i: u32| ((x >> (8 * i)) & 0xFF) as i64;
+    let (h, mi, sec) = (g(0) * 10 + g(1), g(3) * 10 + g(4), g(6) * 10 + g(7));
+    if h > 23 || mi > 59 || sec > 59 {
+        return None;
+    }
+    Some(((t.base[k] + d) * 86_400 + h * 3600 + mi * 60 + sec) * 1000)
+}
+
+/// parse_ts for event and click `ts`: same results for every timestamp inside the
+/// click window; may say None for valid ones far outside it (rejected anyway).
+#[inline(always)]
+fn window_ts(b: &[u8], t: &DateTab) -> Option<i64> {
+    let n = b.len();
+    if n == 20 && b[4] == b'-' {
+        if b[19] != b'Z' {
+            return None;
+        }
+        return table_ms(b, t);
+    }
+    if n == 25 && b[4] == b'-' {
+        let sign = match b[19] {
+            b'+' => 1,
+            b'-' => -1,
+            _ => return None,
+        };
+        if b[22] != b':' {
+            return None;
+        }
+        let oh = d2(b, 20)?;
+        let om = d2(b, 23)?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        return Some(table_ms(b, t)? - sign * (oh * 60 + om) * 60_000);
+    }
+    parse_ts(b)
+}
+
 #[inline]
 fn parse_ts(b: &[u8]) -> Option<i64> {
     let n = b.len();
@@ -1003,6 +1103,7 @@ fn main() {
     let we = manifest_ts(&manifest, "window_end");
     let cws = ws - WEEK;
     let ws_s = ws.div_euclid(1000);
+    let dates: &DateTab = DATES.get_or_init(|| build_dates(cws, we));
     assert!(we - cws < (1i64 << 32), "window too long for u32 offsets");
     let ws_day = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - ws_day + 1).max(1) as usize;
@@ -1121,7 +1222,7 @@ fn main() {
                         if f[1].is_empty() || f[5].is_empty() {
                             break 'v;
                         }
-                        let Some(ts) = parse_ts(f[2]) else { break 'v };
+                        let Some(ts) = window_ts(f[2], dates) else { break 'v };
                         if ts < ws || ts >= we || ingest.saturating_sub(ts) > DAY {
                             break 'v;
                         }
@@ -1146,7 +1247,7 @@ fn main() {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
                     }
-                    let Some(ts) = parse_ts(f[3]) else { return };
+                    let Some(ts) = window_ts(f[3], dates) else { return };
                     if ts < cws || ts >= we {
                         return;
                     }
