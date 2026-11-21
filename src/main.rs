@@ -848,12 +848,24 @@ struct RawEv {
 
 #[derive(Clone, Copy)]
 struct Ev {
-    person: u64,
+    person: u64, // user ID, then person; dense person id inside the sessions phase
     ts: u32,
-    price: u32, // 0 unless purchase
-    pid: u32,   // dense person id inside its partition (sessions phase)
-    cat: u16,
-    purchase: bool,
+    pk: u32, // price (24 bits) | category (7 bits) << 24 | purchase << 31
+}
+
+impl Ev {
+    #[inline(always)]
+    fn price(&self) -> u32 {
+        self.pk & 0xFF_FFFF
+    }
+    #[inline(always)]
+    fn cat(&self) -> usize {
+        ((self.pk >> 24) & 0x7F) as usize
+    }
+    #[inline(always)]
+    fn purchase(&self) -> bool {
+        self.pk >> 31 != 0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1154,6 +1166,7 @@ fn main() {
     cats.sort();
     cats.dedup();
     let ncat = cats.len();
+    assert!(ncat <= 127, "category index must fit 7 bits");
     let unknown = cats.binary_search(&b"unknown".to_vec()).unwrap() as u16;
     let mut products: KMap<u16> = KMap::default();
     for (k, c) in &prod_raw {
@@ -1200,7 +1213,9 @@ fn main() {
     }
     const NE: usize = 256; // event_id partitions
     struct P1 {
-        tup: Vec<Vec<Tup>>,
+        wid: usize,
+        fill: Vec<usize>,      // tuples written into this worker's arena region per partition
+        spill: Vec<Vec<Tup>>,  // overflow when a region is full
         rec: Vec<Ev>,   // valid events in parse order; person holds the user ID until resolved
         alive: Vec<u8>, // 1 per record; dedup clears losers
         cl: Vec<Vec<Click>>,
@@ -1221,7 +1236,23 @@ fn main() {
     }
     let ebytes: usize = esrc.lens.iter().sum();
     let cbytes: usize = csrc.lens.iter().sum();
-    let tcap = ebytes / 60 / nthreads / NE + 64;
+    // One arena for all dedup tuples: a fixed region per (worker, partition), so the
+    // memory is touched once here and reused afterwards for the person shuffle.
+    let capb = std::env::var("CAPB") // test knob: tiny regions exercise the spill path
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(ebytes / 70 / nthreads / NE * 13 / 10 + 64);
+    let arena_cap = nthreads * NE * capb;
+    let mut arena: Vec<Tup> = Vec::with_capacity(arena_cap);
+    struct TupPtr(*mut Tup);
+    unsafe impl Sync for TupPtr {}
+    impl TupPtr {
+        fn get(&self) -> *mut Tup {
+            self.0
+        }
+    }
+    let arena_ptr = TupPtr(arena.as_mut_ptr());
+    let next_wid = AtomicUsize::new(0);
     let rcap = ebytes / 70 / nthreads + 1024;
     let ccap = cbytes / 40 / nthreads / NB + 64;
     let p1: Vec<P1> = std::thread::scope(|sc| {
@@ -1238,7 +1269,9 @@ fn main() {
         nthreads,
         nl + ne + cch.len(),
         || P1 {
-            tup: (0..NE).map(|_| Vec::with_capacity(tcap)).collect(),
+            wid: next_wid.fetch_add(1, AO::Relaxed),
+            fill: vec![0; NE],
+            spill: (0..NE).map(|_| Vec::new()).collect(),
             rec: Vec::with_capacity(rcap),
             alive: Vec::with_capacity(rcap),
             cl: (0..NB).map(|_| Vec::with_capacity(ccap)).collect(),
@@ -1277,14 +1310,13 @@ fn main() {
                         if ts < ws || ts >= we || ingest.saturating_sub(ts) > DAY {
                             break 'v;
                         }
-                        let mut e = Ev { person: 0, ts: (ts - ws) as u32, price: 0, pid: 0, cat: 0, purchase: false };
+                        let mut e = Ev { person: 0, ts: (ts - ws) as u32, pk: 0 };
                         match f[4] {
                             b"view" | b"cart" => {}
                             b"purchase" => {
                                 let Some(p) = parse_price(f[6]) else { break 'v };
-                                e.price = p;
-                                e.cat = *products.get(&pack(f[5])).unwrap_or(&unknown);
-                                e.purchase = true;
+                                let cat = *products.get(&pack(f[5])).unwrap_or(&unknown) as u32;
+                                e.pk = p | cat << 24 | 1 << 31;
                             }
                             _ => break 'v,
                         }
@@ -1293,7 +1325,15 @@ fn main() {
                         st.rec.push(e);
                         st.alive.push(1);
                     }
-                    st.tup[part(eid) & (NE - 1)].push(Tup { eid, ingest: ing32, loc });
+                    let pb = part(eid) & (NE - 1);
+                    let tup = Tup { eid, ingest: ing32, loc };
+                    if st.fill[pb] < capb {
+                        // region (wid, pb) belongs to this worker alone
+                        unsafe { arena_ptr.get().add((st.wid * NE + pb) * capb + st.fill[pb]).write(tup) };
+                        st.fill[pb] += 1;
+                    } else {
+                        st.spill[pb].push(tup);
+                    }
                 });
             } else {
                 scan_lines::<4>(load_chunk(&csrc, cch[t - ne], &mut st.buf), &mut st.bits, |f| {
@@ -1331,13 +1371,18 @@ fn main() {
             self.0[w]
         }
     }
-    let mut tups: Vec<Vec<Mutex<Vec<Tup>>>> = Vec::with_capacity(nw);
+    // per worker id: region fill counts and spills
+    let mut fills: Vec<Vec<usize>> = vec![Vec::new(); nw];
+    let mut spills: Vec<Vec<Vec<Tup>>> = (0..nw).map(|_| Vec::new()).collect();
     let mut recs: Vec<Mutex<Vec<Ev>>> = Vec::with_capacity(nw);
     let mut alives: Vec<Vec<u8>> = Vec::with_capacity(nw);
     let mut clv: Vec<Vec<Vec<Click>>> = Vec::with_capacity(nw);
+    let mut p1 = p1;
+    p1.sort_by_key(|p| p.wid); // worker index == wid everywhere below
     for p in p1 {
         assert!(p.rec.len() < (1 << 27) - 1, "too many records for one worker");
-        tups.push(p.tup.into_iter().map(Mutex::new).collect());
+        fills[p.wid] = p.fill;
+        spills[p.wid] = p.spill;
         recs.push(Mutex::new(p.rec));
         alives.push(p.alive);
         clv.push(p.cl);
@@ -1352,8 +1397,14 @@ fn main() {
         NE,
         || (Vec::<Tup>::new(), Vec::<Tup>::new()),
         |(tab, sub), b| {
-            let mine: Vec<Vec<Tup>> = tups.iter().map(|w| std::mem::take(&mut *w[b].lock().unwrap())).collect();
-            let total: usize = mine.iter().map(|v| v.len()).sum();
+            // this partition's tuples: per worker, its arena region then its spill
+            let mine: Vec<[&[Tup]; 2]> = (0..nw)
+                .map(|w| {
+                    let r = unsafe { std::slice::from_raw_parts(arena_ptr.get().add((w * NE + b) * capb), fills[w][b]) };
+                    [r, &spills[w][b][..]]
+                })
+                .collect();
+            let total: usize = mine.iter().map(|v| v[0].len() + v[1].len()).sum();
             let kill = |wl: u32| {
                 let loc = wl & DEAD;
                 if loc != DEAD {
@@ -1374,13 +1425,15 @@ fn main() {
             sub.reserve(total);
             if ns == 1 {
                 for (w, v) in mine.iter().enumerate() {
-                    sub.extend(v.iter().map(|t| pk(w, t)));
+                    for part in v {
+                        sub.extend(part.iter().map(|t| pk(w, t)));
+                    }
                 }
                 soff[1] = total;
             } else {
                 let sh = 64 - sbits;
                 for v in &mine {
-                    for t in v {
+                    for t in v.iter().flat_map(|x| x.iter()) {
                         soff[(mix(t.eid) >> sh) as usize + 1] += 1;
                     }
                 }
@@ -1390,7 +1443,7 @@ fn main() {
                 let mut fill = soff.clone();
                 let dst = sub.as_mut_ptr();
                 for (w, v) in mine.iter().enumerate() {
-                    for t in v {
+                    for t in v.iter().flat_map(|x| x.iter()) {
                         let k = (mix(t.eid) >> sh) as usize;
                         unsafe { dst.add(fill[k]).write(pk(w, t)) };
                         fill[k] += 1;
@@ -1428,7 +1481,7 @@ fn main() {
             }
         },
     );
-    drop(tups);
+    drop(spills);
     lap("events deduped");
 
     // Person shuffle, count then scatter: each worker resolves the person of its alive
@@ -1481,7 +1534,14 @@ fn main() {
         }
     }
     bstart[NB] = acc;
-    let mut all: Vec<Ev> = Vec::with_capacity(acc);
+    // reuse the arena's pages (tuples are dead now; same size and alignment) when big enough
+    const _: () = assert!(std::mem::size_of::<Tup>() == std::mem::size_of::<Ev>() && std::mem::align_of::<Tup>() == std::mem::align_of::<Ev>());
+    let mut all: Vec<Ev> = if acc <= arena_cap {
+        let mut a = std::mem::ManuallyDrop::new(std::mem::take(&mut arena));
+        unsafe { Vec::from_raw_parts(a.as_mut_ptr() as *mut Ev, 0, a.capacity()) }
+    } else {
+        Vec::with_capacity(acc)
+    };
     struct EvPtr(*mut Ev);
     unsafe impl Sync for EvPtr {}
     impl EvPtr {
@@ -1590,7 +1650,7 @@ fn main() {
                 let pb = rb.as_mut_ptr();
                 for (k, e) in mine.iter().enumerate() {
                     let mut e = *e;
-                    e.pid = pidv[k];
+                    e.person = pidv[k] as u64;
                     let d = (e.ts & 2047) as usize;
                     unsafe { pa.add(h0[d]).write(e) };
                     h0[d] += 1;
@@ -1610,7 +1670,7 @@ fn main() {
                 let mut fill = eoff.clone();
                 for k in 0..n {
                     let e = unsafe { *pa.add(k) };
-                    let d = e.pid as usize;
+                    let d = e.person as usize;
                     unsafe { pb.add(fill[d]).write(e) };
                     fill[d] += 1;
                 }
@@ -1720,14 +1780,14 @@ fn main() {
                         let e = &ev[j];
                         last = ws + e.ts as i64;
                         cnt += 1;
-                        if e.purchase {
+                        if e.purchase() {
                             purch = true;
-                            rev += e.price as i64;
-                            let c = e.cat as usize;
+                            rev += e.price() as i64;
+                            let c = e.cat();
                             if w.catsum[c] == 0 {
                                 w.touched.push(c as u16);
                             }
-                            w.catsum[c] += e.price as i64;
+                            w.catsum[c] += e.price() as i64;
                         }
                         j += 1;
                     }
