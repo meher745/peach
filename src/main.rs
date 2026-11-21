@@ -1340,7 +1340,7 @@ fn main() {
     let ccap = cbytes / 40 / nthreads + 64;
     // Optional page touchers: walk the chunks in task order and fault every page in,
     // so cold reads are issued with more depth than the parsers' own faults give.
-    let touch_n: usize = std::env::var("TOUCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let touch_n: usize = std::env::var("TOUCH").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let touch_next = AtomicUsize::new(0);
     let touch_list: Vec<(&Src, (usize, usize, usize))> = lch
         .iter()
