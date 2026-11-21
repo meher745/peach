@@ -14,8 +14,141 @@ use std::sync::atomic::{AtomicUsize, Ordering as AO};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+// Big allocations (>= THRESH) are served by bumping a pointer through one large anonymous
+// reservation backed by transparent huge pages: no per-allocation bookkeeping, fewer TLB
+// misses, and — because fresh anonymous pages are already zero — `alloc_zeroed` never has
+// to memset (page zeroing was a measured cost here). Memory is not recycled (the process
+// exits right after writing output); a freed big block is returned to the OS with
+// MADV_DONTNEED. Small allocations, and everything once the reservation fills or if it
+// fails, fall through to the system allocator.
+mod bump {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    const THRESH: usize = 64 << 10;
+    const RESERVE: usize = 1 << 37; // 128 GiB of address space (MAP_NORESERVE)
+    const ALIGN: usize = 64;
+    const UNAVAIL: usize = usize::MAX;
+
+    static BASE: AtomicUsize = AtomicUsize::new(0); // 0 = uninit, UNAVAIL = no arena
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct Bump;
+
+    fn region() -> usize {
+        let b = BASE.load(Relaxed);
+        if b != 0 {
+            return b;
+        }
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                RESERVE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        let nb = if p == libc::MAP_FAILED {
+            UNAVAIL
+        } else {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::madvise(p, RESERVE, libc::MADV_HUGEPAGE);
+            }
+            ((p as usize) + (2 << 20) - 1) & !((2 << 20) - 1) // align base up to 2 MiB
+        };
+        match BASE.compare_exchange(0, nb, Relaxed, Relaxed) {
+            Ok(_) => nb,
+            Err(other) => {
+                if nb != UNAVAIL {
+                    unsafe { libc::munmap(p, RESERVE) };
+                }
+                other
+            }
+        }
+    }
+
+    #[inline]
+    fn owns(p: *mut u8) -> bool {
+        let b = BASE.load(Relaxed);
+        b != 0 && b != UNAVAIL && (p as usize) >= b && (p as usize) < b + RESERVE
+    }
+
+    #[inline]
+    unsafe fn take(size: usize) -> *mut u8 {
+        let b = region();
+        if b == UNAVAIL {
+            return std::ptr::null_mut();
+        }
+        let size = (size + ALIGN - 1) & !(ALIGN - 1);
+        let off = NEXT.fetch_add(size, Relaxed);
+        if off + size > RESERVE {
+            return std::ptr::null_mut();
+        }
+        (b + off) as *mut u8
+    }
+
+    unsafe impl GlobalAlloc for Bump {
+        #[inline]
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if l.size() >= THRESH && l.align() <= ALIGN {
+                let p = unsafe { take(l.size()) };
+                if !p.is_null() {
+                    return p;
+                }
+            }
+            unsafe { System.alloc(l) }
+        }
+        #[inline]
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if l.size() >= THRESH && l.align() <= ALIGN {
+                let p = unsafe { take(l.size()) };
+                if !p.is_null() {
+                    return p; // fresh anonymous pages are already zero
+                }
+            }
+            unsafe { System.alloc_zeroed(l) }
+        }
+        #[inline]
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            if owns(p) {
+                // give whole freed pages back to the OS (arena blocks are never reused)
+                if l.size() >= (1 << 20) {
+                    const PG: usize = 1 << 14; // covers 4 KiB and 16 KiB page sizes
+                    let a = ((p as usize) + PG - 1) & !(PG - 1);
+                    let e = ((p as usize) + l.size()) & !(PG - 1);
+                    #[cfg(target_os = "linux")]
+                    if e > a {
+                        unsafe { libc::madvise(a as *mut libc::c_void, e - a, libc::MADV_DONTNEED) };
+                    }
+                }
+            } else {
+                unsafe { System.dealloc(p, l) }
+            }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            let mine = owns(p);
+            if mine && new <= l.size() {
+                return p;
+            }
+            if mine || (new >= THRESH && l.align() <= ALIGN) {
+                let nl = unsafe { Layout::from_size_align_unchecked(new, l.align()) };
+                let q = unsafe { self.alloc(nl) };
+                if !q.is_null() {
+                    unsafe { std::ptr::copy_nonoverlapping(p, q, l.size().min(new)) };
+                    unsafe { self.dealloc(p, l) };
+                }
+                return q;
+            }
+            unsafe { System.realloc(p, l, new) }
+        }
+    }
+}
+
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: bump::Bump = bump::Bump;
 
 const DAY: i64 = 86_400_000;
 const GAP: i64 = 1_800_000;
