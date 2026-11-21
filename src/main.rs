@@ -1042,7 +1042,9 @@ fn open_all(paths: &[PathBuf]) -> Src {
                 return None;
             }
             let m = unsafe { memmap2::MmapOptions::new().map(f).unwrap() };
-            let _ = m.advise(memmap2::Advice::WillNeed);
+            if std::env::var_os("NO_WILLNEED").is_none() {
+                let _ = m.advise(memmap2::Advice::WillNeed);
+            }
             Some(m)
         })
         .collect();
@@ -1280,6 +1282,7 @@ fn main() {
     let ech = chunks(&esrc);
     let cch = chunks(&csrc);
     let ne = ech.len();
+    lap("files opened");
     let lsrc = open_all(&csv_files(&data.join("links")));
     let lch = chunks_sized(&lsrc, 1 << 20);
     let nl = lch.len();
@@ -1299,10 +1302,9 @@ fn main() {
         spill: Vec<Vec<Tup>>,  // overflow when a region is full
         rec: Vec<Ev>,   // valid events in parse order; person holds the user ID until resolved
         alive: Vec<u8>, // 1 per record; dedup clears losers
-        cl: Vec<Vec<Click>>,
+        cl: Vec<Click>, // valid clicks in parse order; person holds the user ID until resolved
         buf: Vec<u8>,
         bits: Vec<[u64; 3]>,
-        pendc: Vec<Click>,
     }
     fn flush_cl(pend: &mut Vec<Click>, cl: &mut [Vec<Click>], lt: &LinkTable) {
         for c in pend.iter() {
@@ -1335,8 +1337,35 @@ fn main() {
     let arena_ptr = TupPtr(arena.as_mut_ptr());
     let next_wid = AtomicUsize::new(0);
     let rcap = ebytes / 70 / nthreads + 1024;
-    let ccap = cbytes / 40 / nthreads / NB + 64;
+    let ccap = cbytes / 40 / nthreads + 64;
+    // Optional page touchers: walk the chunks in task order and fault every page in,
+    // so cold reads are issued with more depth than the parsers' own faults give.
+    let touch_n: usize = std::env::var("TOUCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let touch_next = AtomicUsize::new(0);
+    let touch_list: Vec<(&Src, (usize, usize, usize))> = lch
+        .iter()
+        .map(|&c| (&lsrc, c))
+        .chain(ech.iter().map(|&c| (&esrc, c)))
+        .chain(cch.iter().map(|&c| (&csrc, c)))
+        .collect();
     let p1: Vec<P1> = std::thread::scope(|sc| {
+    for _ in 0..touch_n {
+        sc.spawn(|| {
+            let mut acc = 0u8;
+            loop {
+                let i = touch_next.fetch_add(1, AO::Relaxed);
+                let Some(&(src, (fi, s, e))) = touch_list.get(i) else { break };
+                if let Some(m) = &src.maps[fi] {
+                    let mut o = s;
+                    while o < e {
+                        acc = acc.wrapping_add(unsafe { std::ptr::read_volatile(m.as_ptr().add(o)) });
+                        o += 4096;
+                    }
+                }
+            }
+            std::hint::black_box(acc);
+        });
+    }
     sc.spawn(|| {
         // union-find once every link chunk is parsed (they are the first tasks)
         while links_left.load(AO::Acquire) > 0 {
@@ -1355,10 +1384,9 @@ fn main() {
             spill: (0..NE).map(|_| Vec::new()).collect(),
             rec: Vec::with_capacity(rcap),
             alive: Vec::with_capacity(rcap),
-            cl: (0..NB).map(|_| Vec::with_capacity(ccap)).collect(),
+            cl: Vec::with_capacity(ccap),
             buf: Vec::new(),
             bits: Vec::new(),
-            pendc: Vec::with_capacity(BATCH),
         },
         |st, t| {
             if t < nl {
@@ -1426,20 +1454,16 @@ fn main() {
                         return;
                     }
                     let Some(&camp) = campaigns.get(&pack(f[2])) else { return };
-                    let person = pack_reg(f[1]);
+                    let person = pack_reg(f[1]); // the ID; the person is looked up after parsing
                     let click = pack_reg(f[0]);
-                    st.pendc.push(Click { person, click, ts: (ts - cws) as u32, camp });
-                    if st.pendc.len() == BATCH {
-                        flush_cl(&mut st.pendc, &mut st.cl, link_cell.wait());
-                    }
+                    st.cl.push(Click { person, click, ts: (ts - cws) as u32, camp });
                 });
-                flush_cl(&mut st.pendc, &mut st.cl, link_cell.wait());
             }
         },
     )
     });
     lap("events+clicks parsed");
-    let link_map = link_cell.get().unwrap();
+    let link_map = link_cell.wait();
     let nw = p1.len();
 
     // Dedup per event_id partition: the first copy seen is held in the table; each
@@ -1457,7 +1481,7 @@ fn main() {
     let mut spills: Vec<Vec<Vec<Tup>>> = (0..nw).map(|_| Vec::new()).collect();
     let mut recs: Vec<Mutex<Vec<Ev>>> = Vec::with_capacity(nw);
     let mut alives: Vec<Vec<u8>> = Vec::with_capacity(nw);
-    let mut clv: Vec<Vec<Vec<Click>>> = Vec::with_capacity(nw);
+    let mut clv: Vec<Mutex<Vec<Click>>> = Vec::with_capacity(nw);
     let mut p1 = p1;
     p1.sort_by_key(|p| p.wid); // worker index == wid everywhere below
     for p in p1 {
@@ -1466,9 +1490,8 @@ fn main() {
         spills[p.wid] = p.spill;
         recs.push(Mutex::new(p.rec));
         alives.push(p.alive);
-        clv.push(p.cl);
+        clv.push(Mutex::new(p.cl));
     }
-    let clicks_by = transpose(clv);
     let alive_ptr = Shared(alives.iter_mut().map(|a| a.as_mut_ptr()).collect());
     // loc packs the worker (5 bits) and record index (27 bits); DEAD marks an invalid copy
     const DEAD: u32 = (1 << 27) - 1;
@@ -1569,6 +1592,7 @@ fn main() {
     // records (prefetch ring over the link table), counts them per person partition,
     // then writes them straight into one shared array at its own offsets.
     let counts: Vec<Mutex<Vec<usize>>> = (0..nw).map(|_| Mutex::new(Vec::new())).collect();
+    let ccounts: Vec<Mutex<Vec<usize>>> = (0..nw).map(|_| Mutex::new(Vec::new())).collect();
     workers(nthreads, nw, || (), |_, w| {
         let mut rec = recs[w].lock().unwrap();
         let alive = &alives[w];
@@ -1602,6 +1626,34 @@ fn main() {
             c[part(p)] += 1;
         }
         *counts[w].lock().unwrap() = c;
+        // clicks: resolve and count the same way
+        let mut cl = clv[w].lock().unwrap();
+        let mut cc = vec![0usize; NB];
+        let mut nr = 0usize;
+        for i in 0..cl.len() {
+            let k = cl[i].person;
+            if !link_map.maybe(k) {
+                cc[part(k)] += 1;
+                continue;
+            }
+            link_map.prefetch(k);
+            let slot = &mut ring[nr & (RING - 1)];
+            if nr >= RING {
+                let j = *slot as usize;
+                let p = link_map.get(cl[j].person);
+                cl[j].person = p;
+                cc[part(p)] += 1;
+            }
+            *slot = i as u32;
+            nr += 1;
+        }
+        for k in nr.saturating_sub(RING)..nr {
+            let j = ring[k & (RING - 1)] as usize;
+            let p = link_map.get(cl[j].person);
+            cl[j].person = p;
+            cc[part(p)] += 1;
+        }
+        *ccounts[w].lock().unwrap() = cc;
     });
     let counts: Vec<Vec<usize>> = counts.into_iter().map(|m| m.into_inner().unwrap()).collect();
     let mut off: Vec<Vec<usize>> = vec![vec![0; NB]; nw];
@@ -1615,6 +1667,27 @@ fn main() {
         }
     }
     bstart[NB] = acc;
+    let ccounts: Vec<Vec<usize>> = ccounts.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let mut coffw: Vec<Vec<usize>> = vec![vec![0; NB]; nw];
+    let mut cbstart = vec![0usize; NB + 1];
+    let mut cacc = 0;
+    for b in 0..NB {
+        cbstart[b] = cacc;
+        for w in 0..nw {
+            coffw[w][b] = cacc;
+            cacc += ccounts[w][b];
+        }
+    }
+    cbstart[NB] = cacc;
+    let mut allc: Vec<Click> = Vec::with_capacity(cacc);
+    struct ClPtr(*mut Click);
+    unsafe impl Sync for ClPtr {}
+    impl ClPtr {
+        fn get(&self) -> *mut Click {
+            self.0
+        }
+    }
+    let cdst = ClPtr(allc.as_mut_ptr());
     // reuse the arena's pages (tuples are dead now; same size and alignment) when big enough
     const _: () = assert!(std::mem::size_of::<Tup>() == std::mem::size_of::<Ev>() && std::mem::align_of::<Tup>() == std::mem::align_of::<Ev>());
     let mut all: Vec<Ev> = if acc <= arena_cap {
@@ -1644,8 +1717,17 @@ fn main() {
                 pos[b] += 1;
             }
         }
+        let cl = clv[w].lock().unwrap();
+        let mut pos = coffw[w].clone();
+        for c in cl.iter() {
+            let b = part(c.person);
+            unsafe { cdst.get().add(pos[b]).write(*c) };
+            pos[b] += 1;
+        }
     });
     unsafe { all.set_len(acc) };
+    unsafe { allc.set_len(cacc) };
+    drop(clv);
     drop(recs);
     drop(alives);
     lap("persons shuffled");
@@ -1768,17 +1850,15 @@ fn main() {
             drop(pidv);
             let ev: &[Ev] = &rb;
 
-            let mine = std::mem::take(&mut *clicks_by[b].lock().unwrap());
+            let cmine: &[Click] = &allc[cbstart[b]..cbstart[b + 1]];
             let mut coff = vec![0usize; np + 1];
-            let mut cpid: Vec<u32> = Vec::with_capacity(mine.iter().map(|o| o.len()).sum());
-            for o in &mine {
-                for c in o {
-                    let id = pm.get(&c.person).map_or(u32::MAX, |&x| x);
-                    if id != u32::MAX {
-                        coff[id as usize] += 1;
-                    }
-                    cpid.push(id);
+            let mut cpid: Vec<u32> = Vec::with_capacity(cmine.len());
+            for c in cmine {
+                let id = pm.get(&c.person).map_or(u32::MAX, |&x| x);
+                if id != u32::MAX {
+                    coff[id as usize] += 1;
                 }
+                cpid.push(id);
             }
             let mut acc = 0;
             for x in coff.iter_mut() {
@@ -1790,20 +1870,15 @@ fn main() {
             {
                 let mut fill = coff.clone();
                 let dst = cl.as_mut_ptr();
-                let mut k = 0;
-                for o in &mine {
-                    for c in o {
-                        let id = cpid[k];
-                        if id != u32::MAX {
-                            unsafe { dst.add(fill[id as usize]).write(*c) };
-                            fill[id as usize] += 1;
-                        }
-                        k += 1;
+                for (k, c) in cmine.iter().enumerate() {
+                    let id = cpid[k];
+                    if id != u32::MAX {
+                        unsafe { dst.add(fill[id as usize]).write(*c) };
+                        fill[id as usize] += 1;
                     }
                 }
                 unsafe { cl.set_len(acc) };
             }
-            drop(mine);
             // sort each person's clicks by (ts, click_id desc) and drop duplicate click_ids
             let mut wpos = 0;
             for pi in 0..np {
