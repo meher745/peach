@@ -1,13 +1,15 @@
 [package]
-name = "solution"
+name = "shopping-sessions"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "shopping-sessions"
+path = "src/main.rs"
 
 [dependencies]
-hashbrown = "0.17.1"
 libc = "0.2"
-memchr = "2.8.3"
-memmap2 = "0.9.12"
 
 [profile.release]
 opt-level = 3
@@ -15,7 +17,9 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+incremental = false
 
-[profile.profiling]
+[profile.prof]
 inherits = "release"
-debug = true
+debug = "line-tables-only"
+strip = false

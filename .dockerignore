@@ -1,5 +1,5 @@
-target/
-fixtures/
-scripts/
-*.md
-.git
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
