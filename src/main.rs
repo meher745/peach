@@ -546,6 +546,20 @@ fn p8(w: u64) -> u64 {
 /// Digits-only value of `b` (1..=16 bytes), None if any byte is not an ASCII digit.
 #[inline(always)]
 fn digits16(b: &[u8]) -> Option<u64> {
+    let n = b.len();
+    if n > 8 {
+        // two direct loads (overlapping when n < 16); no stack copy, so no
+        // store-to-load forwarding stall
+        let w1 = u64::from_le_bytes(b[n - 8..].try_into().unwrap());
+        let sh = 8 * (16 - n) as u32;
+        let head = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let pad = if sh == 0 { 0 } else { 0x3030_3030_3030_3030u64 >> (64 - sh) };
+        let w0 = if sh == 0 { head } else { (head << sh) | pad };
+        if !(digits_ok(w0, !0) & digits_ok(w1, !0)) {
+            return None;
+        }
+        return Some(p8(w0) * 100_000_000 + p8(w1));
+    }
     let mut buf = [b'0'; 16];
     buf[16 - b.len()..].copy_from_slice(b);
     let w0 = u64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -1322,6 +1336,7 @@ fn main() {
     let mut alives: Vec<Vec<u8>> = Vec::with_capacity(nw);
     let mut clv: Vec<Vec<Vec<Click>>> = Vec::with_capacity(nw);
     for p in p1 {
+        assert!(p.rec.len() < (1 << 27) - 1, "too many records for one worker");
         tups.push(p.tup.into_iter().map(Mutex::new).collect());
         recs.push(Mutex::new(p.rec));
         alives.push(p.alive);
@@ -1329,38 +1344,81 @@ fn main() {
     }
     let clicks_by = transpose(clv);
     let alive_ptr = Shared(alives.iter_mut().map(|a| a.as_mut_ptr()).collect());
+    // loc packs the worker (5 bits) and record index (27 bits); DEAD marks an invalid copy
+    const DEAD: u32 = (1 << 27) - 1;
+    assert!(nw <= 32);
     workers(
         nthreads,
         NE,
-        Vec::<(u64, u32, u32, u32)>::new,
-        |tab, b| {
+        || (Vec::<Tup>::new(), Vec::<Tup>::new()),
+        |(tab, sub), b| {
             let mine: Vec<Vec<Tup>> = tups.iter().map(|w| std::mem::take(&mut *w[b].lock().unwrap())).collect();
             let total: usize = mine.iter().map(|v| v.len()).sum();
-            let cap = (total * 2).next_power_of_two().max(16);
-            let mask = cap - 1;
-            tab.clear();
-            tab.resize(cap, (0, 0, 0, 0));
-            let kill = |w: u32, loc: u32| {
-                if loc != u32::MAX {
+            let kill = |wl: u32| {
+                let loc = wl & DEAD;
+                if loc != DEAD {
                     // distinct bytes per record; only this task decides about this event
-                    unsafe { alive_ptr.at(w as usize).add(loc as usize).write(0) };
+                    unsafe { alive_ptr.at((wl >> 27) as usize).add(loc as usize).write(0) };
                 }
             };
-            for (w, v) in mine.iter().enumerate() {
-                for t in v {
+            let pk = |w: usize, t: &Tup| Tup {
+                eid: t.eid,
+                ingest: t.ingest,
+                loc: ((w as u32) << 27) | if t.loc == u32::MAX { DEAD } else { t.loc },
+            };
+            // split into cache-sized pieces by high hash bits (table slots use low bits)
+            let sbits = (total / 16384).next_power_of_two().trailing_zeros().min(8);
+            let ns = 1usize << sbits;
+            let mut soff = vec![0usize; ns + 1];
+            sub.clear();
+            sub.reserve(total);
+            if ns == 1 {
+                for (w, v) in mine.iter().enumerate() {
+                    sub.extend(v.iter().map(|t| pk(w, t)));
+                }
+                soff[1] = total;
+            } else {
+                let sh = 64 - sbits;
+                for v in &mine {
+                    for t in v {
+                        soff[(mix(t.eid) >> sh) as usize + 1] += 1;
+                    }
+                }
+                for i in 0..ns {
+                    soff[i + 1] += soff[i];
+                }
+                let mut fill = soff.clone();
+                let dst = sub.as_mut_ptr();
+                for (w, v) in mine.iter().enumerate() {
+                    for t in v {
+                        let k = (mix(t.eid) >> sh) as usize;
+                        unsafe { dst.add(fill[k]).write(pk(w, t)) };
+                        fill[k] += 1;
+                    }
+                }
+                unsafe { sub.set_len(total) };
+            }
+            drop(mine);
+            for si in 0..ns {
+                let piece = &sub[soff[si]..soff[si + 1]];
+                let cap = (piece.len() * 2).next_power_of_two().max(16);
+                let mask = cap - 1;
+                tab.clear();
+                tab.resize(cap, Tup { eid: 0, ingest: 0, loc: 0 });
+                for t in piece {
                     let mut i = mix(t.eid) as usize & mask;
                     loop {
                         let sl = unsafe { tab.get_unchecked_mut(i) };
-                        if sl.0 == 0 {
-                            *sl = (t.eid, t.ingest, w as u32, t.loc);
+                        if sl.eid == 0 {
+                            *sl = *t;
                             break;
                         }
-                        if sl.0 == t.eid {
-                            if t.ingest < sl.1 {
-                                kill(sl.2, sl.3);
-                                *sl = (t.eid, t.ingest, w as u32, t.loc);
+                        if sl.eid == t.eid {
+                            if t.ingest < sl.ingest {
+                                kill(sl.loc);
+                                *sl = *t;
                             } else {
-                                kill(w as u32, t.loc);
+                                kill(t.loc);
                             }
                             break;
                         }
