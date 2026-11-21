@@ -398,6 +398,25 @@ fn quote_count(m: &[[u64; 3]], a: usize, b: usize) -> u32 {
 /// those fields hold exactly two quotes each and every other field none.
 #[inline(always)]
 fn scan_lines<'a, const N: usize>(buf: &'a [u8], bits: &mut Vec<[u64; 3]>, mut f: impl FnMut(&[&'a [u8]; N])) {
+    // Work in cache-sized windows that end right after a newline, so the bytes the
+    // masks were built from are still in L1/L2 when the lines are cut.
+    const WIN: usize = 32 << 10;
+    let mut s = 0;
+    while s < buf.len() {
+        let mut e = (s + WIN).min(buf.len());
+        if e < buf.len() {
+            e = match memchr::memchr(b'\n', &buf[e..]) {
+                Some(o) => e + o + 1,
+                None => buf.len(),
+            };
+        }
+        scan_window(&buf[s..e], bits, &mut f);
+        s = e;
+    }
+}
+
+#[inline(always)]
+fn scan_window<'a, const N: usize>(buf: &'a [u8], bits: &mut Vec<[u64; 3]>, f: &mut impl FnMut(&[&'a [u8]; N])) {
     let len = buf.len();
     let words = len.div_ceil(64);
     bits.clear();
@@ -1071,27 +1090,51 @@ fn main() {
     let (p1e, p1c): (Vec<Vec<Vec<RawEv>>>, Vec<Vec<Vec<Click>>>) = p1.into_iter().map(|p| (p.ev, p.cl)).unzip();
     let p1e = transpose(p1e);
     let clicks_by = transpose(p1c);
-    let p2: Vec<Vec<Vec<Ev>>> = workers(
+    let p2: Vec<(Vec<Vec<Ev>>, Vec<(u64, u32, u32)>)> = workers(
         nthreads,
         NB,
-        || (0..NB).map(|_| Vec::new()).collect::<Vec<Vec<Ev>>>(),
+        || ((0..NB).map(|_| Vec::new()).collect::<Vec<Vec<Ev>>>(), Vec::new()),
         |outb, b| {
             let p1 = std::mem::take(&mut *p1e[b].lock().unwrap());
             let total: usize = p1.iter().map(|p| p.len()).sum();
-            let mut m: KMap<(u32, u32)> = KMap::with_capacity_and_hasher(total, Default::default());
+            // eid -> (smallest ingest, index of that copy); eid 0 never occurs (empty IDs dropped)
+            let cap = (total * 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            let tab = &mut outb.1;
+            tab.clear();
+            tab.resize(cap, (0, 0, 0));
             let mut g = 0u32;
             for p in &p1 {
                 for r in p {
-                    m.entry(r.eid)
-                        .and_modify(|v| {
-                            if r.ingest < v.0 {
-                                *v = (r.ingest, g);
+                    let mut i = mix(r.eid) as usize & mask;
+                    loop {
+                        let t = unsafe { tab.get_unchecked_mut(i) };
+                        if t.0 == 0 {
+                            *t = (r.eid, r.ingest, g);
+                            break;
+                        }
+                        if t.0 == r.eid {
+                            if r.ingest < t.1 {
+                                t.1 = r.ingest;
+                                t.2 = g;
                             }
-                        })
-                        .or_insert((r.ingest, g));
+                            break;
+                        }
+                        i = (i + 1) & mask;
+                    }
                     g += 1;
                 }
             }
+            let winner = |eid: u64| -> u32 {
+                let mut i = mix(eid) as usize & mask;
+                loop {
+                    let t = unsafe { tab.get_unchecked(i) };
+                    if t.0 == eid {
+                        return t.2;
+                    }
+                    i = (i + 1) & mask;
+                }
+            };
             let mut g = 0u32;
             let mut win: Vec<Ev> = Vec::with_capacity(BATCH);
             let flush = |win: &mut Vec<Ev>, outb: &mut Vec<Vec<Ev>>| {
@@ -1105,7 +1148,7 @@ fn main() {
             };
             for p in &p1 {
                 for r in p {
-                    if r.flags & 1 != 0 && m.get(&r.eid).unwrap().1 == g {
+                    if r.flags & 1 != 0 && winner(r.eid) == g {
                         win.push(Ev {
                             person: r.person,
                             ts: r.ts,
@@ -1114,16 +1157,16 @@ fn main() {
                             purchase: r.flags & 2 != 0,
                         });
                         if win.len() == BATCH {
-                            flush(&mut win, outb);
+                            flush(&mut win, &mut outb.0);
                         }
                     }
                     g += 1;
                 }
             }
-            flush(&mut win, outb);
+            flush(&mut win, &mut outb.0);
         },
     );
-    let p2 = transpose(p2);
+    let p2 = transpose(p2.into_iter().map(|x| x.0).collect());
     lap("events deduped");
 
     // sessionize + attribute per person partition
@@ -1150,43 +1193,117 @@ fn main() {
             rows: Vec::new(),
         },
         |w, b| {
+            // Group by person: dense ids in first-seen order, counting-sort scatter,
+            // then time order inside each person.
             let mine = std::mem::take(&mut *p2[b].lock().unwrap());
-            let mut ev: Vec<Ev> = Vec::with_capacity(mine.iter().map(|o| o.len()).sum());
-            for o in mine {
-                ev.extend_from_slice(&o);
+            let n: usize = mine.iter().map(|o| o.len()).sum();
+            let mut pm: KMap<u32> = KMap::with_capacity_and_hasher(n / 8 + 16, Default::default());
+            let mut persons: Vec<u64> = Vec::new();
+            let mut eoff: Vec<usize> = Vec::new();
+            let mut pid: Vec<u32> = Vec::with_capacity(n);
+            for o in &mine {
+                for e in o {
+                    let id = *pm.entry(e.person).or_insert_with(|| {
+                        persons.push(e.person);
+                        eoff.push(0);
+                        (persons.len() - 1) as u32
+                    });
+                    eoff[id as usize] += 1;
+                    pid.push(id);
+                }
             }
-            ev.sort_unstable_by(|x, y| x.person.cmp(&y.person).then(x.ts.cmp(&y.ts)));
-            let mine = std::mem::take(&mut *clicks_by[b].lock().unwrap());
-            let mut cl: Vec<Click> = Vec::with_capacity(mine.iter().map(|o| o.len()).sum());
-            for o in mine {
-                cl.extend_from_slice(&o);
+            let np = persons.len();
+            let mut acc = 0;
+            for x in eoff.iter_mut() {
+                let c = *x;
+                *x = acc;
+                acc += c;
             }
-            cl.sort_unstable_by(|x, y| {
-                x.person
-                    .cmp(&y.person)
-                    .then(x.ts.cmp(&y.ts))
-                    .then_with(|| cmp_str(y.click, x.click))
-            });
-            cl.dedup_by(|a, b| a.click == b.click && a.person == b.person);
+            eoff.push(acc);
+            let mut ev: Vec<Ev> = Vec::with_capacity(n);
+            {
+                let mut fill = eoff.clone();
+                let dst = ev.as_mut_ptr();
+                let mut k = 0;
+                for o in &mine {
+                    for e in o {
+                        let id = pid[k] as usize;
+                        unsafe { dst.add(fill[id]).write(*e) };
+                        fill[id] += 1;
+                        k += 1;
+                    }
+                }
+                unsafe { ev.set_len(n) };
+            }
+            drop(mine);
+            drop(pid);
+            for pi in 0..np {
+                let r = &mut ev[eoff[pi]..eoff[pi + 1]];
+                if r.len() > 1 {
+                    r.sort_unstable_by_key(|e| e.ts);
+                }
+            }
 
-            let mut i = 0;
-            let mut cj = 0;
-            let n = ev.len();
-            while i < n {
-                let person = ev[i].person;
-                let mut ee = i;
-                while ee < n && ev[ee].person == person {
-                    ee += 1;
+            let mine = std::mem::take(&mut *clicks_by[b].lock().unwrap());
+            let mut coff = vec![0usize; np + 1];
+            let mut cpid: Vec<u32> = Vec::with_capacity(mine.iter().map(|o| o.len()).sum());
+            for o in &mine {
+                for c in o {
+                    let id = pm.get(&c.person).map_or(u32::MAX, |&x| x);
+                    if id != u32::MAX {
+                        coff[id as usize] += 1;
+                    }
+                    cpid.push(id);
                 }
-                while cj < cl.len() && cl[cj].person < person {
-                    cj += 1;
+            }
+            let mut acc = 0;
+            for x in coff.iter_mut() {
+                let c = *x;
+                *x = acc;
+                acc += c;
+            }
+            let mut cl: Vec<Click> = Vec::with_capacity(acc);
+            {
+                let mut fill = coff.clone();
+                let dst = cl.as_mut_ptr();
+                let mut k = 0;
+                for o in &mine {
+                    for c in o {
+                        let id = cpid[k];
+                        if id != u32::MAX {
+                            unsafe { dst.add(fill[id as usize]).write(*c) };
+                            fill[id as usize] += 1;
+                        }
+                        k += 1;
+                    }
                 }
-                let cs = cj;
-                let mut ce = cj;
-                while ce < cl.len() && cl[ce].person == person {
-                    ce += 1;
+                unsafe { cl.set_len(acc) };
+            }
+            drop(mine);
+            // sort each person's clicks by (ts, click_id desc) and drop duplicate click_ids
+            let mut wpos = 0;
+            for pi in 0..np {
+                let (s0, s1) = (coff[pi], coff[pi + 1]);
+                coff[pi] = wpos;
+                let r = &mut cl[s0..s1];
+                r.sort_unstable_by(|x, y| x.ts.cmp(&y.ts).then_with(|| cmp_str(y.click, x.click)));
+                let mut last: Option<u64> = None;
+                for k in s0..s1 {
+                    let c = cl[k];
+                    if last == Some(c.click) {
+                        continue;
+                    }
+                    last = Some(c.click);
+                    cl[wpos] = c;
+                    wpos += 1;
                 }
-                cj = ce;
+            }
+            coff[np] = wpos;
+
+            for pi in 0..np {
+                let person = persons[pi];
+                let (i, ee) = (eoff[pi], eoff[pi + 1]);
+                let (cs, ce) = (coff[pi], coff[pi + 1]);
                 let (mut lo, mut hi) = (cs, cs);
 
                 let mut cur_day = i64::MIN;
@@ -1279,7 +1396,6 @@ fn main() {
                     w.cnt[cl[k].camp as usize] = 0;
                 }
                 w.active.clear();
-                i = ee;
             }
         },
     );
