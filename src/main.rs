@@ -1654,7 +1654,7 @@ fn main() {
 
     // sessionize + attribute per person partition
     struct W {
-        camp: Vec<[i64; 4]>, // [day][campaign]: credited sessions, purchasing, revenue
+        camp: Vec<(u32, u32, u64)>, // [day][campaign]: credited sessions, purchasing, revenue
         asst: Vec<u32>,      // [day][campaign]: assisted sessions
         cnt: Vec<u32>,
         pos: Vec<u32>,
@@ -1677,7 +1677,7 @@ fn main() {
         nthreads,
         NB,
         || W {
-            camp: vec![[0; 4]; ncampo * ndays],
+            camp: vec![(0, 0, 0); ncampo * ndays],
             asst: vec![0; ncampo * ndays],
             cnt: vec![0; ncampo],
             pos: vec![0; ncampo],
@@ -1909,9 +1909,10 @@ fn main() {
                     let credited = if hi > lo { cl[hi - 1].camp } else { organic } as usize;
                     let di = (d - ws_day) as usize;
                     let a = &mut w.camp[di * ncampo + credited];
-                    a[0] += 1;
-                    a[1] += purch as i64;
-                    a[2] += rev;
+                    // per worker: at most one count per session, far below u32::MAX
+                    a.0 += 1;
+                    a.1 += purch as u32;
+                    a.2 += rev as u64;
                     let row = &mut w.asst[di * ncampo..(di + 1) * ncampo];
                     for &c in &w.active {
                         row[c as usize] += 1;
@@ -1944,7 +1945,7 @@ fn main() {
             for d in 0..ndays {
                 for k in 0..ncampo {
                     let a = w.camp[d * ncampo + k];
-                    c[k * ndays + d] = [a[0], a[1], a[2], w.asst[d * ncampo + k] as i64];
+                    c[k * ndays + d] = [a.0 as i64, a.1 as i64, a.2 as i64, w.asst[d * ncampo + k] as i64];
                 }
             }
             (c, w.rows)
